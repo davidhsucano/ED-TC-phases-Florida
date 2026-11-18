@@ -1,0 +1,2018 @@
+---
+title: "Weekly ED Encounters & Tropical Cyclone Phases"
+output: html_document
+editor_options:
+  chunk_output_type: console
+Author: James B. Elsner 
+Adapted by: David Hsu 
+---
+
+## Summary
+
+Experimental setup. We use emergency department (ED) encounters for Florida counties from the Agency for Health Care Administration (AHCA), tabulated by the data provider around the impact date of each tropical cyclone (TC). Each TC is buffered by its radius of maximum winds (RMW) from the IBTrACS tracks to make a wind swath, and a county is exposed to a TC when any part of the county falls within the swath. For each exposed county we label three storm phases: Threat (the 7 days before impact), Impact (the impact day), and Cleanup (the 7 days after impact). The reference (None) weeks are hurricane-season county-weeks that contain no storm-phase day for any TC at the same wind threshold. We fit a fixed-effects Poisson model where the dependent variable is the encounter count in each county window, the fixed effects are county and year-month, the logarithm of the window length (days) is an offset so the 1-day Impact window and the 7-day windows are on the same per-day scale, and the standard errors are clustered by county and year-month. The model is fit separately for all-cause encounters, ten cause-specific categories, and four age groups, at three wind thresholds (≥34, ≥55, and ≥64 kt). The study period is 2005–2023 (40, 20, and 11 TCs at the three thresholds).
+
+Results. See the Results tables section at the end of the document. Every number reported in the manuscript is collected there and written to `outputs/results_tables/`.
+
+## Settings and data locations
+
+The data folders are set here and nowhere else. `Ed_county_weekly_confidential` holds the AHCA encounter files, which are not public and are not included with the code. `Ed_county_weekly_public` holds the IBTrACS storm tracks (downloaded from NOAA if missing) and the USDA Rural-Urban Continuum Codes. The Florida county boundaries are downloaded by `tigris`.
+
+Injury encounters are identified from the first external-cause (E) code, the same definition used in the weekly baseline file. The storm-aligned injury file `ED_Injuries_FirstEcode.csv` is the provider's ≥34 and ≥55 kt extract under that definition, with ≥64 kt rows added by `build_injury_64kt_from_march.R`: a storm's rows depend only on its impact date, so the ≥64 kt rows are the storm's ≥55 kt rows wherever the two impact dates agree (all storms in the study period). A later extract that also counted other code positions (`ED_Injuries.csv`) does not match the baseline and is not used.
+```{r}
+library(sf)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(readr)
+library(ggplot2)
+library(fixest)
+library(tigris)
+library(purrr)
+library(stringr)
+library(broom)
+
+options(tigris_use_cache = TRUE)
+
+begin_year      <- 2004
+end_year        <- 2024 
+storm_end_date  <- as.Date("2023-12-31")  
+# Note: ED Data for 2004 2024 are not available, as a result, we only include analysis from 2005 to 2023 
+none_end_date   <- as.Date("2023-12-31")  # same end date for the baseline weeks
+threshold_use   <- 34L                    # primary wind threshold (kt)
+thresholds      <- c(34L, 55L, 64L)
+n_cleanup_weeks <- 1                      # Cleanup = post-impact week 1 (days 1-7)
+
+conf_dir    <- here::here("Ed_county_weekly_confidential")   # AHCA encounter files
+public_dir  <- here::here("Ed_county_weekly_public")         # IBTrACS tracks and USDA codes
+ed_dir      <- conf_dir                                      # all-cause files
+cat_dir     <- conf_dir                                      # category and age files
+ns_dir      <- conf_dir                                      # weekly baseline files
+ibtracs_dir <- public_dir
+rucc_file   <- file.path(public_dir, "Ruralurbancontinuumcodes2023.csv")
+
+storm_aligned_file  <- file.path(ed_dir, "ED_AllCause.csv")   # provider file ED_Cyclones_AllCause_by_County_34kt55kt64kt_Threat1_Threat4_Threat7_PostWeekly_2yr.csv
+daily_allcause_path <- file.path(ed_dir, "ER_AllCause_County_by_Day_05_24.csv")
+category_file <- function(short_name)                          # storm-aligned file for each category
+  file.path(cat_dir, if (short_name == "Injuries") "ED_Injuries_FirstEcode.csv" else paste0("ED_", short_name, ".csv")) #Here we appled a fix that reconciles Injuries data with baseline reference
+
+fig_dir <- here::here("figs")
+out_dir <- here::here("outputs")
+dir.create(fig_dir, showWarnings = FALSE)
+dir.create(out_dir, showWarnings = FALSE)
+```
+
+## Input consistency check
+
+The storm-aligned files and the baseline files are separate extracts from the provider, and they must count encounters the same way, otherwise the phase coefficients absorb the difference between the extracts. Every 7-day post-impact window in a storm-aligned file covers a calendar week that also appears in the baseline file, so the two counts can be compared directly. All-cause windows are compared with the daily file summed over the same 7 days; cause-specific and age windows are compared with the weekly baseline files (Sunday to Saturday). The weekly age baseline reports 18–44 and 45–64 separately, and a count of 5 or fewer is suppressed (the row is absent), so when one of the two is missing the summed 18–64 count can be 1 to 5 lower than the storm-aligned 18–64 count. Those weeks are counted as explained by suppression. Any other difference stops the document.
+```{r}
+week_windows <- function(path) {   # 7-day post-impact windows, one row per county-week
+  readr::read_csv(path, show_col_types = FALSE) |>
+    dplyr::mutate(window_start = as.Date(window_start), window_end = as.Date(window_end),
+                  County = as.integer(County)) |>
+    dplyr::filter(County != 99, grepl("^Post_Week", Window),
+                  as.integer(window_end - window_start) == 6) |>
+    dplyr::distinct(dplyr::across(dplyr::any_of(c("County", "window_start", "AgeGroup"))), Visits)
+}
+
+compare_counts <- function(storm, base, label) {
+  keys <- intersect(c("County", "window_start", "AgeGroup"), names(base))
+  j <- dplyr::inner_join(storm, base, by = keys) |>
+    dplyr::mutate(diff = Visits - base,
+                  suppressed = !is.na(n_parts) & n_parts < 2 & diff >= 1 & diff <= 5)
+  tibble::tibble(input          = label,
+                 weeks_compared = nrow(j),
+                 equal          = sum(j$diff == 0),
+                 suppressed     = sum(j$diff != 0 & j$suppressed),
+                 unexplained    = sum(j$diff != 0 & !j$suppressed),
+                 conflicting    = sum(duplicated(storm[keys])))
+}
+
+# All-cause: storm-aligned windows vs the daily file summed over the same 7 days
+daily7 <- readr::read_csv(daily_allcause_path, show_col_types = FALSE) |>
+  dplyr::transmute(County = as.integer(County), Date = as.Date(Date), Visits) |>
+  dplyr::filter(County != 99) |>
+  dplyr::arrange(County, Date) |>
+  dplyr::group_by(County) |>
+  tidyr::complete(Date = seq(min(Date), max(Date), by = "day")) |>
+  dplyr::mutate(base = Visits + dplyr::lead(Visits, 1) + dplyr::lead(Visits, 2) + dplyr::lead(Visits, 3) +
+                       dplyr::lead(Visits, 4) + dplyr::lead(Visits, 5) + dplyr::lead(Visits, 6)) |>
+  dplyr::ungroup() |>
+  dplyr::filter(!is.na(base)) |>
+  dplyr::transmute(County, window_start = Date, base, n_parts = NA_integer_)
+input_check <- compare_counts(week_windows(storm_aligned_file), daily7, "All-cause")
+
+# Cause-specific: storm-aligned windows vs the weekly category baseline
+cat_base <- readr::read_csv(file.path(ns_dir, "Combined_ER_Weekly_By_County_DiseaseCategories.csv"),
+                            show_col_types = FALSE) |>
+  dplyr::mutate(County = as.integer(County), window_start = as.Date(Week)) |>
+  dplyr::filter(County != 99) |>
+  dplyr::group_by(Category, County, window_start) |>
+  dplyr::summarize(base = sum(Weekly_Visits), .groups = "drop") |>
+  dplyr::mutate(n_parts = NA_integer_)
+
+check_files <- c(CVD = "cardiovascular", Diabetes = "diabetes", Digestive = "digestive",
+                 Endocrine = "endocrine", Infectious = "infectious", Injuries = "injuries",
+                 Neoplasms = "neoplasms", Neuropsych = "neuropsych", Renal = "renal",
+                 Respiratory = "respiratory")
+for (k in names(check_files)) {
+  input_check <- dplyr::bind_rows(input_check, compare_counts(
+    week_windows(category_file(k)),
+    cat_base |> dplyr::filter(Category == check_files[[k]]) |> dplyr::select(-Category),
+    check_files[[k]]))
+}
+
+# Age groups: storm-aligned windows vs the weekly age baseline (18-44 and 45-64 summed)
+age_base <- readr::read_csv(file.path(ns_dir, "ER_AllCause_AgeGroups_County_Weekly.csv"),
+                            show_col_types = FALSE) |>
+  dplyr::mutate(County = as.integer(County), window_start = as.Date(Week),
+                AgeGroup = dplyr::case_when(AgeGroup == "0_to_4"                    ~ "Under 5",
+                                            AgeGroup == "5_to_17"                   ~ "5 to 17",
+                                            AgeGroup %in% c("18_to_44", "45_to_64") ~ "18 to 64",
+                                            AgeGroup == "65+"                       ~ "Over 65")) |>
+  dplyr::filter(County != 99, !is.na(AgeGroup)) |>
+  dplyr::group_by(AgeGroup, County, window_start) |>
+  dplyr::summarize(base = sum(Visits), n_parts = dplyr::n(), .groups = "drop") |>
+  dplyr::mutate(n_parts = ifelse(AgeGroup == "18 to 64", n_parts, NA_integer_))
+input_check <- dplyr::bind_rows(input_check, compare_counts(
+  week_windows(file.path(cat_dir, "ED_Age_Cats.csv")), age_base, "Age groups"))
+
+readr::write_csv(input_check, file.path(out_dir, "input_consistency_check.csv"))
+as.data.frame(input_check)
+
+bad <- input_check |> dplyr::filter(unexplained > 0 | conflicting > 0)
+if (nrow(bad) > 0) {
+  stop("Storm-aligned and baseline counts differ for the same county-weeks: ",
+       paste0(bad$input, " (", bad$unexplained, " of ", bad$weeks_compared, " weeks)", collapse = "; "),
+       ". The extracts do not count encounters the same way; fix the input files before fitting.")
+}
+```
+
+## Florida county codes
+
+AHCA numbers the counties 1–67 alphabetically (code 99 is the statewide total), so we need a lookup to the FIPS codes used by the county boundaries. Miami-Dade is code 13 but FIPS 12086.
+```{r}
+ahca_fips <- tibble::tribble(
+  ~ahca_code, ~county_name,    ~county_fips,
+   1L, "Alachua",       "12001",
+   2L, "Baker",         "12003",
+   3L, "Bay",           "12005",
+   4L, "Bradford",      "12007",
+   5L, "Brevard",       "12009",
+   6L, "Broward",       "12011",
+   7L, "Calhoun",       "12013",
+   8L, "Charlotte",     "12015",
+   9L, "Citrus",        "12017",
+  10L, "Clay",          "12019",
+  11L, "Collier",       "12021",
+  12L, "Columbia",      "12023",
+  13L, "Miami-Dade",    "12086",
+  14L, "DeSoto",        "12027",
+  15L, "Dixie",         "12029",
+  16L, "Duval",         "12031",
+  17L, "Escambia",      "12033",
+  18L, "Flagler",       "12035",
+  19L, "Franklin",      "12037",
+  20L, "Gadsden",       "12039",
+  21L, "Gilchrist",     "12041",
+  22L, "Glades",        "12043",
+  23L, "Gulf",          "12045",
+  24L, "Hamilton",      "12047",
+  25L, "Hardee",        "12049",
+  26L, "Hendry",        "12051",
+  27L, "Hernando",      "12053",
+  28L, "Highlands",     "12055",
+  29L, "Hillsborough",  "12057",
+  30L, "Holmes",        "12059",
+  31L, "Indian River",  "12061",
+  32L, "Jackson",       "12063",
+  33L, "Jefferson",     "12065",
+  34L, "Lafayette",     "12067",
+  35L, "Lake",          "12069",
+  36L, "Lee",           "12071",
+  37L, "Leon",          "12073",
+  38L, "Levy",          "12075",
+  39L, "Liberty",       "12077",
+  40L, "Madison",       "12079",
+  41L, "Manatee",       "12081",
+  42L, "Marion",        "12083",
+  43L, "Martin",        "12085",
+  44L, "Monroe",        "12087",
+  45L, "Nassau",        "12089",
+  46L, "Okaloosa",      "12091",
+  47L, "Okeechobee",    "12093",
+  48L, "Orange",        "12095",
+  49L, "Osceola",       "12097",
+  50L, "Palm Beach",    "12099",
+  51L, "Pasco",         "12101",
+  52L, "Pinellas",      "12103",
+  53L, "Polk",          "12105",
+  54L, "Putnam",        "12107",
+  55L, "Santa Rosa",    "12113",
+  56L, "Sarasota",      "12115",
+  57L, "Seminole",      "12117",
+  58L, "St. Johns",     "12109",
+  59L, "St. Lucie",     "12111",
+  60L, "Sumter",        "12119",
+  61L, "Suwannee",      "12121",
+  62L, "Taylor",        "12123",
+  63L, "Union",         "12125",
+  64L, "Volusia",       "12127",
+  65L, "Wakulla",       "12129",
+  66L, "Walton",        "12131",
+  67L, "Washington",    "12133"
+)
+
+fl_counties_geo <- tigris::counties(state = "FL", year = 2020, cb = TRUE) |>
+  dplyr::select(county_fips = GEOID, geometry)
+```
+
+## Storm swaths and exposed counties
+
+Get and import the IBTrACS storm tracks
+```{r}
+L <- "https://www.ncei.noaa.gov/data/international-best-track-archive-for-climate-stewardship-ibtracs/v04r01/access/shapefile/IBTrACS.NA.list.v04r01.lines.zip"
+
+if(!"IBTrACS.NA.list.v04r01.lines.zip" %in% list.files(ibtracs_dir)) {
+  dir.create(ibtracs_dir, showWarnings = FALSE)
+  download.file(url = L,
+                destfile = file.path(ibtracs_dir, "IBTrACS.NA.list.v04r01.lines.zip"))
+  unzip(file.path(ibtracs_dir, "IBTrACS.NA.list.v04r01.lines.zip"),
+        exdir = ibtracs_dir)
+}
+
+Tracks.sf <- sf::st_read(dsn = ibtracs_dir,
+                         layer = "IBTrACS.NA.list.v04r01.lines",
+                         quiet = TRUE) |>
+  sf::st_transform(crs = 32616) |>   # UTM 16N for buffering in meters
+  dplyr::filter(year >= begin_year, year <= end_year)
+```
+
+Build the swath for each storm at each wind threshold and find the counties it intersects. Track segments at or above the threshold are kept, missing RMW values are filled in three passes (storm mean, then central pressure mean, then storm mean again), each segment is buffered by its RMW, and the buffers are dissolved to one polygon per storm. Any overlap with a county counts as exposure.
+```{r}
+counties_utm.sf <- tigris::counties(state = "FL", year = 2020, cb = TRUE) |>
+  sf::st_transform(crs = 32616) |>
+  dplyr::select(county_fips = GEOID) |>
+  dplyr::left_join(ahca_fips, by = "county_fips")
+
+build_swath_lookup <- function(thresh) {
+  tr <- Tracks.sf |>
+    dplyr::filter(USA_WIND >= thresh) |>
+    dplyr::select(SID, USA_WIND, USA_PRES, USA_RMW) |>
+    dplyr::group_by(SID) |>       # pedigree
+    dplyr::mutate(USA_RMW = ifelse(is.na(USA_RMW), mean(USA_RMW, na.rm = TRUE), USA_RMW)) |>
+    dplyr::group_by(USA_PRES) |>  # minimum pressure
+    dplyr::mutate(USA_RMW = ifelse(is.na(USA_RMW), mean(USA_RMW, na.rm = TRUE), USA_RMW)) |>
+    dplyr::group_by(SID) |>       # pedigree
+    dplyr::mutate(USA_RMW = ifelse(is.na(USA_RMW), mean(USA_RMW, na.rm = TRUE), USA_RMW)) |>
+    dplyr::ungroup() |>
+    dplyr::filter(!is.na(USA_RMW))
+
+  sw <- sf::st_buffer(tr, dist = tr$USA_RMW * 1852) |>  # 1852 converts nautical miles to meters
+    dplyr::group_by(SID) |>
+    dplyr::summarize(.groups = "drop")
+
+  idx <- sf::st_intersects(sw, counties_utm.sf)
+  tibble::tibble(
+    SID             = rep(sw$SID, lengths(idx)),
+    ahca_code       = counties_utm.sf$ahca_code[unlist(idx)],
+    threshold_knots = thresh
+  ) |>
+    dplyr::distinct()
+}
+
+swath_county <- purrr::map_dfr(thresholds, build_swath_lookup)
+
+# Keep only the storm x county rows whose county intersects the storm's swath
+apply_swath_filter <- function(df, county_col = "County") {
+  df |>
+    dplyr::mutate(.ahca = as.integer(.data[[county_col]])) |>
+    dplyr::semi_join(swath_county, by = c("SID" = "SID",
+                                          ".ahca" = "ahca_code",
+                                          "threshold_knots" = "threshold_knots")) |>
+    dplyr::select(-.ahca)
+}
+```
+
+## All-cause ED encounters
+
+The provider file has one row per storm, county, threshold, and window (Threat_7d, Landfall_Day0, and Post_Week_1 to Post_Week_105), and every storm is tabulated against all 67 counties. `ED_allcause_state` keeps all counties and is used only in the section on the Threat phase without a swath. `ED_allcause` keeps the counties inside each storm's swath and is used everywhere else. Counts stay raw; the window length goes into the model as an offset.
+```{r}
+ED_allcause_state <- readr::read_csv(storm_aligned_file, show_col_types = FALSE) |>
+  dplyr::mutate(
+    impact_date  = as.Date(impact_date),
+    window_start = as.Date(window_start),
+    window_end   = as.Date(window_end),
+    County       = as.integer(County)
+  ) |>
+  dplyr::filter(impact_date <= storm_end_date) |>
+  dplyr::mutate(window_days = as.integer(window_end - window_start) + 1L)
+
+ED_allcause <- ED_allcause_state |>
+  apply_swath_filter(county_col = "County")
+
+ED_allcause |>
+  dplyr::filter(threshold_knots == threshold_use, Window == "Threat_7d") |>
+  dplyr::count(SID, name = "n_counties") |>
+  dplyr::summarize(storms = dplyr::n(), min = min(n_counties),
+                   median = median(n_counties), max = max(n_counties))
+```
+
+Label the storm phases at the primary threshold. Only hurricane-season (May–November) windows are kept. When two storms give the same county the same phase in the same week, the row with more encounters is kept.
+```{r}
+storm_obs <- ED_allcause |>
+  dplyr::filter(County != 99, threshold_knots == threshold_use) |>
+  dplyr::mutate(effect = dplyr::case_when(
+    Window == "Threat_7d"                                          ~ "Threat",
+    Window == "Landfall_Day0"                                      ~ "Impact",
+    !is.na(PostWeek) & PostWeek >= 1 & PostWeek <= n_cleanup_weeks ~ "Cleanup",
+    TRUE                                                           ~ NA_character_)) |>
+  dplyr::filter(!is.na(effect)) |>
+  dplyr::filter(lubridate::month(window_start) %in% 5:11) |>
+  dplyr::rename(ahca_code = County) |>
+  dplyr::mutate(year_month = as.character(lubridate::floor_date(window_start, "month")),
+                county_fe  = factor(as.integer(ahca_code))) |>
+  dplyr::select(SID, ahca_code, county_fe, Visits, window_days,
+                effect, window_start, year_month) |>
+  dplyr::group_by(ahca_code, window_start, effect) |>
+  dplyr::slice_max(Visits, n = 1, with_ties = FALSE) |>
+  dplyr::ungroup()
+
+table(storm_obs$effect)
+```
+
+## Non-TC (None) baseline
+
+Flag every county-week that contains a storm-phase day for any storm at the primary threshold. Two keys are kept: Monday-anchored weeks for the all-cause baseline built from the daily file, and Sunday-anchored weeks for the provider's weekly files, which are tabulated Sunday to Saturday.
+```{r}
+storm_active_days <- ED_allcause |>
+  dplyr::filter(County != 99, threshold_knots == threshold_use) |>
+  dplyr::filter(Window %in% c("Threat_7d", "Threat_4d", "Threat_1d", "Landfall_Day0") |
+                (!is.na(PostWeek) & PostWeek >= 1 & PostWeek <= n_cleanup_weeks)) |>
+  dplyr::rename(ahca_code = County) |>
+  dplyr::rowwise() |>
+  dplyr::mutate(dates = list(seq(window_start, window_end, by = "day"))) |>
+  tidyr::unnest(dates) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(week_mon = as.Date(lubridate::floor_date(dates, unit = "week", week_start = 1)),
+                week_sun = as.Date(lubridate::floor_date(dates, unit = "week", week_start = 7))) |>
+  dplyr::distinct(ahca_code, week_mon, week_sun)
+
+storm_active_weeks <- storm_active_days |>
+  dplyr::distinct(ahca_code, week_mon) |>
+  dplyr::mutate(storm_active = TRUE)
+storm_active_weeks_sun <- storm_active_days |>
+  dplyr::distinct(ahca_code, week_sun) |>
+  dplyr::mutate(storm_active = TRUE)
+```
+
+Aggregate the daily all-cause file to complete Monday-anchored weeks, remove the storm-active weeks, and keep hurricane-season weeks. Days with 5 or fewer encounters are suppressed by AHCA and are absent from the daily file, so requiring complete weeks also removes any week containing a suppressed day. Weeks with 42 or fewer encounters are also dropped.
+```{r}
+daily_raw <- readr::read_csv(daily_allcause_path, show_col_types = FALSE) |>
+  dplyr::mutate(Date = as.Date(Date), County = as.integer(County)) |>
+  dplyr::filter(County != 99,
+                Date >= as.Date(paste0(begin_year, "-01-01")),
+                Date <= as.Date(paste0(end_year, "-12-31"))) |>
+  dplyr::mutate(ahca_code = County,
+                week_mon  = as.Date(lubridate::floor_date(Date, unit = "week", week_start = 1)))
+
+weekly_allcause_ns <- daily_raw |>
+  dplyr::group_by(ahca_code, week_mon) |>
+  dplyr::summarize(Visits = sum(Visits, na.rm = TRUE), n_days = n(), .groups = "drop") |>
+  dplyr::filter(n_days == 7)
+
+none_obs <- weekly_allcause_ns |>
+  dplyr::left_join(storm_active_weeks, by = c("ahca_code", "week_mon")) |>
+  dplyr::filter(is.na(storm_active)) |>
+  dplyr::select(-storm_active) |>
+  dplyr::filter(Visits > 42) |>
+  dplyr::filter(lubridate::month(week_mon) %in% 5:11,
+                week_mon <= none_end_date) |>
+  dplyr::mutate(effect       = "None",
+                window_days  = 7L,
+                window_start = week_mon,
+                year_month   = as.character(lubridate::floor_date(week_mon, "month")),
+                county_fe    = factor(as.integer(ahca_code))) |>
+  dplyr::select(ahca_code, county_fe, Visits, window_days, effect, window_start, year_month)
+
+nrow(none_obs)
+```
+
+## All-cause model
+
+Stack the storm-phase and None observations and fit the fixed-effects Poisson model at the primary threshold. The coefficients are log rate ratios relative to None weeks in the same county and year-month. This model supplies the all-cause row of Table 1 and the true estimates for the falsification test.
+```{r}
+ED_panel <- dplyr::bind_rows(
+  storm_obs |> dplyr::select(ahca_code, county_fe, Visits, window_days,
+                             effect, window_start, year_month),
+  none_obs  |> dplyr::select(ahca_code, county_fe, Visits, window_days,
+                             effect, window_start, year_month)) |>
+  dplyr::mutate(effect     = factor(effect, levels = c("None", "Cleanup", "Threat", "Impact")),
+                year_month = factor(year_month),
+                county_fe  = factor(as.integer(ahca_code)))
+
+m_allcause <- fixest::fepois(
+  Visits ~ i(effect, ref = "None") | county_fe + year_month,
+  offset  = ~ log(window_days),
+  data    = ED_panel,
+  cluster = ~ county_fe + year_month
+)
+
+summary(m_allcause)
+```
+
+## All-cause phase effects by wind threshold (Figure 2)
+
+Repeat the model at each threshold. The storm phases, the storm-active mask, and the None weeks are all rebuilt for the threshold. The `ed` argument defaults to the swath-filtered file; the section on the Threat phase without a swath passes the statewide file instead.
+```{r}
+fit_allcause_threshold <- function(thresh, threat_window, n_cleanup, ed = ED_allcause) {
+  storm_obs_t <- ed |>
+    dplyr::filter(County != 99, threshold_knots == thresh) |>
+    dplyr::mutate(effect = dplyr::case_when(
+      Window == threat_window                                  ~ "Threat",
+      Window == "Landfall_Day0"                                ~ "Impact",
+      !is.na(PostWeek) & PostWeek >= 1 & PostWeek <= n_cleanup ~ "Cleanup",
+      TRUE                                                     ~ NA_character_)) |>
+    dplyr::filter(!is.na(effect), lubridate::month(window_start) %in% 5:11) |>
+    dplyr::rename(ahca_code = County) |>
+    dplyr::mutate(year_month = as.character(lubridate::floor_date(window_start, "month")),
+                  county_fe  = factor(as.integer(ahca_code))) |>
+    dplyr::select(ahca_code, county_fe, Visits, window_days, effect, window_start, year_month) |>
+    dplyr::group_by(ahca_code, window_start, effect) |>
+    dplyr::slice_max(Visits, n = 1, with_ties = FALSE) |>
+    dplyr::ungroup()
+
+  mask_t <- ed |>
+    dplyr::filter(County != 99, threshold_knots == thresh) |>
+    dplyr::filter(Window %in% c("Threat_7d", "Threat_4d", "Threat_1d", "Landfall_Day0") |
+                  (!is.na(PostWeek) & PostWeek >= 1 & PostWeek <= n_cleanup)) |>
+    dplyr::rename(ahca_code = County) |>
+    dplyr::rowwise() |>
+    dplyr::mutate(dates = list(seq(window_start, window_end, by = "day"))) |>
+    tidyr::unnest(dates) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(week_mon = as.Date(lubridate::floor_date(dates, unit = "week", week_start = 1))) |>
+    dplyr::distinct(ahca_code, week_mon) |>
+    dplyr::mutate(storm_active = TRUE)
+
+  none_t <- weekly_allcause_ns |>
+    dplyr::filter(Visits > 42, week_mon <= none_end_date) |>
+    dplyr::left_join(mask_t, by = c("ahca_code", "week_mon")) |>
+    dplyr::filter(is.na(storm_active)) |>
+    dplyr::select(-storm_active) |>
+    dplyr::filter(lubridate::month(week_mon) %in% 5:11) |>
+    dplyr::mutate(effect       = "None",
+                  window_days  = 7L,
+                  window_start = week_mon,
+                  year_month   = as.character(lubridate::floor_date(week_mon, "month")),
+                  county_fe    = factor(as.integer(ahca_code))) |>
+    dplyr::select(ahca_code, county_fe, Visits, window_days, effect, window_start, year_month)
+
+  panel_t <- dplyr::bind_rows(storm_obs_t, none_t) |>
+    dplyr::mutate(effect     = factor(effect, levels = c("None", "Cleanup", "Threat", "Impact")),
+                  year_month = factor(year_month),
+                  county_fe  = factor(as.integer(ahca_code)))
+
+  fit <- fixest::fepois(
+    Visits ~ i(effect, ref = "None") | county_fe + year_month,
+    offset  = ~ log(window_days),
+    data    = panel_t,
+    cluster = ~ county_fe + year_month
+  )
+
+  broom::tidy(fit, conf.int = TRUE) |>
+    dplyr::filter(grepl("effect", term)) |>
+    dplyr::mutate(effect_label = stringr::str_extract(term, "(?<=::)[A-Za-z]+"),
+                  pct_change   = 100 * (exp(estimate) - 1),
+                  pct_ci_lo    = 100 * (exp(conf.low) - 1),
+                  pct_ci_hi    = 100 * (exp(conf.high) - 1),
+                  threshold    = thresh) |>
+    dplyr::select(threshold, effect_label, pct_change, pct_ci_lo, pct_ci_hi, p.value)
+}
+
+fig_dat <- purrr::map_dfr(thresholds, fit_allcause_threshold,
+                          threat_window = "Threat_7d",
+                          n_cleanup     = n_cleanup_weeks) |>
+  dplyr::mutate(effect_label = factor(effect_label, levels = c("Threat", "Impact", "Cleanup")),
+                threshold    = factor(paste0("≥", threshold, " kt"),
+                                      levels = paste0("≥", thresholds, " kt")))
+
+p_multi <- ggplot(fig_dat, aes(x = effect_label, y = pct_change)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "gray55") +
+  geom_errorbar(aes(ymin = pct_ci_lo, ymax = pct_ci_hi),
+                width = 0.12, linewidth = 0.7, colour = "grey20") +
+  geom_point(size = 2.8, colour = "grey20") +
+  facet_wrap(~ threshold, nrow = 1) +
+  labs(x = NULL,
+       y = "% change in weekly ED encounters vs non-TC baseline",
+       caption = paste0("All-cause, RMW corridor exposure. Points: Poisson FE ",
+                        "estimates; bars: 95% CIs")) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold"),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.25),
+        panel.spacing.x = grid::unit(1.2, "lines"))
+p_multi
+
+ggsave(file.path(fig_dir, "Figure2_allcause_phases_by_threshold.png"),
+       p_multi, width = 10, height = 5, dpi = 300, bg = "white")
+# JESEE artwork, PDF copies only (the PNG files and plot objects above are unchanged): at the
+# journal's two-column width (175-178 mm) text must be 5-7 pt and lines at least 1 pt, and
+# explanatory notes belong in the figure legend rather than inside the image.
+jesee_lines <- function(p, min_lw) {  # raise every layer's line width to at least min_lw (mm)
+  p$layers <- lapply(p$layers, function(l) {
+    l  <- structure(rlang::env_clone(l), class = class(l))  # copy the layer; the original plot is not modified
+    lw <- l$aes_params$linewidth
+    if (is.null(lw)) lw <- l$geom$default_aes$linewidth
+    if (is.numeric(lw) && lw < min_lw) l$aes_params$linewidth <- min_lw
+    if (inherits(l$geom, "GeomPoint")) {  # outline of plotted points: same minimum as the lines
+      st <- l$aes_params$stroke
+      if (is.null(st)) st <- l$geom$default_aes$stroke
+      st_min <- min_lw * ggplot2::.pt * 2 / ggplot2::.stroke
+      if (is.numeric(st) && st < st_min) l$aes_params$stroke <- st_min
+    }
+    l
+  })
+  p
+}
+p_multi_pdf <- jesee_lines(p_multi, 0.75) + labs(caption = NULL) +
+  theme(axis.title.y = element_text(size = 9.8),
+        panel.grid.major.y = element_line(linewidth = 0.75))
+ggsave(file.path(fig_dir, "Figure2_allcause_phases_by_threshold.pdf"),
+       p_multi_pdf, width = 10, height = 5, device = cairo_pdf, bg = "white")
+```
+
+## Cause-specific models (Figure 3)
+
+Load the ten cause-specific storm-aligned files and apply the same swath filter.
+```{r}
+cat_files <- c(CVD = "cardiovascular", Diabetes = "diabetes", Digestive = "digestive",
+               Endocrine = "endocrine", Infectious = "infectious", Injuries = "injuries",
+               Neoplasms = "neoplasms", Neuropsych = "neuropsych", Renal = "renal",
+               Respiratory = "respiratory")
+
+read_ed_category <- function(short_name) {
+  readr::read_csv(category_file(short_name),
+                  show_col_types = FALSE) |>
+    dplyr::filter(as.Date(impact_date) <= storm_end_date) |>
+    dplyr::mutate(Category     = unname(cat_files[short_name]),
+                  impact_date  = as.Date(impact_date),
+                  window_start = as.Date(window_start),
+                  window_end   = as.Date(window_end),
+                  County       = as.integer(County),
+                  window_days  = as.integer(window_end - window_start) + 1L) |>
+    apply_swath_filter(county_col = "County")
+}
+
+ED_disease <- purrr::map_dfr(names(cat_files), read_ed_category)
+table(ED_disease$Category)
+```
+
+Load the weekly non-storm category file for the None weeks. The provider weeks run Sunday to Saturday; `week_mon` (Sunday + 1) is the week label. The week of 2015-09-27 spans the change from ICD-9 to ICD-10 on 1 October 2015 and is reported under both coding systems, so the counts are summed over `ICD_Type` to give one observation per county-week.
+```{r}
+combined_ns <- readr::read_csv(file.path(ns_dir, "Combined_ER_Weekly_By_County_DiseaseCategories.csv"),
+                               show_col_types = FALSE) |>
+  dplyr::filter(County != 99) |>
+  dplyr::mutate(County    = as.integer(County),
+                ahca_code = County,
+                week_mon  = as.Date(Week) + 1L,
+                Visits    = Weekly_Visits) |>
+  dplyr::filter(ahca_code >= 1L, ahca_code <= 67L,
+                as.Date(Week) >= as.Date(paste0(begin_year, "-01-01")),
+                as.Date(Week) <= as.Date(paste0(end_year, "-12-31")),
+                week_mon <= none_end_date) |>
+  dplyr::group_by(Category, ahca_code, week_mon) |>
+  dplyr::summarize(Visits = sum(Visits, na.rm = TRUE), .groups = "drop")
+```
+
+Fit one model per category. The None weeks come from the category's own weekly file with the Sunday-keyed storm-active weeks removed.
+```{r}
+fit_disease_model <- function(df_cat, thresh, n_cleanup) {
+  cat_name <- unique(df_cat$Category)
+  empty <- tibble::tibble(Category = cat_name, effect_label = NA_character_,
+                          pct_change = NA_real_, pct_ci_lo = NA_real_,
+                          pct_ci_hi = NA_real_, p.value = NA_real_)
+
+  storm_cat <- df_cat |>
+    dplyr::filter(County != 99, threshold_knots == thresh) |>
+    dplyr::rename(ahca_code = County) |>
+    dplyr::mutate(effect = dplyr::case_when(
+      Window == "Threat_7d"                                    ~ "Threat",
+      Window == "Landfall_Day0"                                ~ "Impact",
+      !is.na(PostWeek) & PostWeek >= 1 & PostWeek <= n_cleanup ~ "Cleanup",
+      TRUE                                                     ~ NA_character_)) |>
+    dplyr::filter(!is.na(effect), lubridate::month(window_start) %in% 5:11) |>
+    dplyr::mutate(year_month = as.character(lubridate::floor_date(window_start, "month")),
+                  county_fe  = factor(as.integer(ahca_code))) |>
+    dplyr::select(ahca_code, county_fe, Visits, window_days, effect, window_start, year_month)
+
+  none_cat <- combined_ns |>
+    dplyr::filter(Category == cat_name) |>
+    dplyr::mutate(week_sun = week_mon - 1L) |>
+    dplyr::left_join(storm_active_weeks_sun, by = c("ahca_code", "week_sun")) |>
+    dplyr::filter(is.na(storm_active)) |>
+    dplyr::select(-storm_active, -week_sun) |>
+    dplyr::filter(lubridate::month(week_mon) %in% 5:11) |>
+    dplyr::mutate(effect       = "None",
+                  window_days  = 7L,
+                  window_start = week_mon,
+                  year_month   = as.character(lubridate::floor_date(week_mon, "month")),
+                  county_fe    = factor(as.integer(ahca_code))) |>
+    dplyr::select(ahca_code, county_fe, Visits, window_days, effect, window_start, year_month)
+  if (nrow(none_cat) == 0) return(empty)
+
+  panel <- dplyr::bind_rows(storm_cat, none_cat) |>
+    dplyr::mutate(effect     = factor(effect, levels = c("None", "Cleanup", "Threat", "Impact")),
+                  year_month = factor(year_month),
+                  county_fe  = factor(as.integer(ahca_code)))
+  if (nrow(panel) < 50 || length(unique(panel$effect)) < 2) return(empty)
+
+  fit <- tryCatch(
+    fixest::fepois(Visits ~ i(effect, ref = "None") | county_fe + year_month,
+                   offset  = ~ log(window_days),
+                   data    = panel,
+                   cluster = ~ county_fe + year_month),
+    error = function(e) NULL)
+  if (is.null(fit)) return(empty)
+
+  broom::tidy(fit, conf.int = TRUE) |>
+    dplyr::filter(grepl("effect", term)) |>
+    dplyr::mutate(Category     = cat_name,
+                  effect_label = stringr::str_extract(term, "(?<=::)[A-Za-z]+"),
+                  pct_change   = 100 * (exp(estimate) - 1),
+                  pct_ci_lo    = 100 * (exp(conf.low) - 1),
+                  pct_ci_hi    = 100 * (exp(conf.high) - 1)) |>
+    dplyr::select(Category, effect_label, pct_change, pct_ci_lo, pct_ci_hi, p.value)
+}
+```
+
+The storm-active weeks depend on the threshold, so they are rebuilt inside the loop over thresholds and restored to the primary threshold afterwards. `build_disease_mask()` is also used by the age models and the maps.
+```{r}
+build_disease_mask <- function(thresh, n_cleanup, ed = ED_allcause) {
+  ed |>
+    dplyr::filter(County != 99, threshold_knots == thresh) |>
+    dplyr::filter(Window %in% c("Threat_7d", "Threat_4d", "Threat_1d", "Landfall_Day0") |
+                  (!is.na(PostWeek) & PostWeek >= 1 & PostWeek <= n_cleanup)) |>
+    dplyr::rename(ahca_code = County) |>
+    dplyr::rowwise() |>
+    dplyr::mutate(dates = list(seq(window_start, window_end, by = "day"))) |>
+    tidyr::unnest(dates) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(week_mon = as.Date(lubridate::floor_date(dates, unit = "week", week_start = 1)),
+                  week_sun = as.Date(lubridate::floor_date(dates, unit = "week", week_start = 7))) |>
+    dplyr::distinct(ahca_code, week_mon, week_sun)
+}
+
+storm_active_weeks_main     <- storm_active_weeks
+storm_active_weeks_sun_main <- storm_active_weeks_sun
+
+disease_results_all <- list()
+for (th in thresholds) {
+  mask_days <- build_disease_mask(th, n_cleanup_weeks)
+  storm_active_weeks <- mask_days |>
+    dplyr::distinct(ahca_code, week_mon) |>
+    dplyr::mutate(storm_active = TRUE)
+  storm_active_weeks_sun <- mask_days |>
+    dplyr::distinct(ahca_code, week_sun) |>
+    dplyr::mutate(storm_active = TRUE)
+  disease_results_all[[as.character(th)]] <- ED_disease |>
+    dplyr::group_by(Category) |>
+    dplyr::group_split() |>
+    purrr::map_dfr(fit_disease_model, thresh = th, n_cleanup = n_cleanup_weeks) |>
+    dplyr::mutate(threshold_knots = th)
+}
+disease_results_all <- dplyr::bind_rows(disease_results_all)
+
+storm_active_weeks     <- storm_active_weeks_main
+storm_active_weeks_sun <- storm_active_weeks_sun_main
+```
+
+Figure 3
+```{r, fig.width=10, fig.height=6.5}
+cat_labels <- c(cardiovascular = "Cardiovascular", respiratory = "Respiratory",
+                renal = "Renal", diabetes = "Diabetes", neuropsych = "Neuropsychiatric",
+                digestive = "Digestive", infectious = "Infectious disease",
+                neoplasms = "Neoplasms", endocrine = "Endocrine", injuries = "Injuries")
+
+plot_df <- disease_results_all |>
+  dplyr::filter(!is.na(pct_change)) |>
+  dplyr::mutate(effect_label  = factor(effect_label, levels = c("Threat", "Impact", "Cleanup")),
+                threshold_lab = factor(sprintf("≥%d kt", threshold_knots),
+                                       levels = c("≥34 kt", "≥55 kt", "≥64 kt")),
+                cat_lab       = cat_labels[Category])
+
+cat_order <- plot_df |>   # order categories by the 34 kt Threat estimate
+  dplyr::filter(threshold_knots == 34, effect_label == "Threat") |>
+  dplyr::arrange(pct_change) |>
+  dplyr::pull(cat_lab)
+plot_df <- plot_df |>
+  dplyr::mutate(cat_lab = factor(cat_lab, levels = cat_order))
+
+p_disease_all <- ggplot(plot_df, aes(x = pct_change, y = cat_lab,
+                                     colour = threshold_lab, shape = threshold_lab)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "gray55") +
+  geom_pointrange(aes(xmin = pct_ci_lo, xmax = pct_ci_hi),
+                  position = position_dodge(width = 0.72),
+                  size = 0.75, linewidth = 0.62, fatten = 2.6) +
+  scale_colour_manual(values = c("≥34 kt" = "#0072B2", "≥55 kt" = "#D55E00", "≥64 kt" = "#009E73"),
+                      name = "Wind threshold") +
+  scale_shape_manual(values = c("≥34 kt" = 16, "≥55 kt" = 17, "≥64 kt" = 15),
+                     name = "Wind threshold") +
+  facet_wrap(~ effect_label, ncol = 3, scales = "free_x") +
+  labs(x = "% change in weekly ED encounters vs non-TC baseline", y = NULL,
+       caption = paste0("Cause-specific, RMW corridor exposure. Markers: Poisson FE ",
+                        "estimates; bars: 95% CIs")) +
+  guides(colour = guide_legend(override.aes = list(linewidth = 1.1, size = 0.9))) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold"),
+        panel.grid.major.x = element_line(colour = "grey92", linewidth = 0.25),
+        panel.grid.major.y = element_line(colour = "grey88", linewidth = 0.3),
+        panel.spacing.x = grid::unit(1.4, "lines"))
+p_disease_all
+
+ggsave(file.path(fig_dir, "Figure3_cause_specific_by_threshold.png"), p_disease_all,
+       width = 11, height = 7.5, dpi = 300, bg = "white")
+p_disease_pdf <- jesee_lines(p_disease_all, 0.85) + labs(caption = NULL) +
+  theme(axis.title.x = element_text(size = 10.5), legend.title = element_text(size = 10.5),
+        panel.grid.major.x = element_line(linewidth = 0.85),
+        panel.grid.major.y = element_line(linewidth = 0.85))
+ggsave(file.path(fig_dir, "Figure3_cause_specific_by_threshold.pdf"), p_disease_pdf,
+       width = 11, height = 7.5, device = cairo_pdf, bg = "white")
+```
+
+## Age groups (Figure 4)
+
+Load the age-stratified storm-aligned file and apply the swath filter.
+```{r}
+age_df <- readr::read_csv(file.path(cat_dir, "ED_Age_Cats.csv"), show_col_types = FALSE) |>
+  dplyr::filter(as.Date(impact_date) <= storm_end_date) |>
+  dplyr::mutate(impact_date  = as.Date(impact_date),
+                window_start = as.Date(window_start),
+                window_end   = as.Date(window_end),
+                County       = as.integer(County),
+                window_days  = as.integer(window_end - window_start) + 1L,
+                SubgroupCol  = AgeGroup) |>
+  apply_swath_filter(county_col = "County")
+
+age_levels <- c("Under 5", "5 to 17", "18 to 64", "Over 65")
+table(age_df$SubgroupCol)
+```
+
+Load the weekly non-storm age file for the None weeks. Its age groups are mapped to the storm-aligned groups (18–44 and 45–64 are summed to 18–64).
+```{r}
+age_ns <- readr::read_csv(file.path(ns_dir, "ER_AllCause_AgeGroups_County_Weekly.csv"),
+                          show_col_types = FALSE) |>
+  dplyr::filter(County != 99) |>
+  dplyr::mutate(County    = as.integer(County),
+                ahca_code = County,
+                week_mon  = as.Date(Week) + 1L,
+                AgeGroup_harmonised = dplyr::case_when(
+                  AgeGroup == "0_to_4"                    ~ "Under 5",
+                  AgeGroup == "5_to_17"                   ~ "5 to 17",
+                  AgeGroup %in% c("18_to_44", "45_to_64") ~ "18 to 64",
+                  AgeGroup == "65+"                       ~ "Over 65",
+                  TRUE                                    ~ NA_character_)) |>
+  dplyr::filter(!is.na(AgeGroup_harmonised),
+                ahca_code >= 1L, ahca_code <= 67L,
+                as.Date(Week) >= as.Date(paste0(begin_year, "-01-01")),
+                as.Date(Week) <= as.Date(paste0(end_year, "-12-31")),
+                week_mon <= none_end_date) |>
+  dplyr::group_by(ahca_code, week_mon, AgeGroup_harmonised) |>
+  dplyr::summarize(Visits = sum(Visits, na.rm = TRUE), .groups = "drop") |>
+  dplyr::rename(SubgroupCol = AgeGroup_harmonised)
+```
+
+Fit one model per age group at each threshold. The model is the same as for the cause-specific categories.
+```{r}
+fit_age_model <- function(df_sub, thresh, n_cleanup) {
+  subgroup_name <- unique(df_sub$SubgroupCol)
+  empty <- tibble::tibble(Subgroup = subgroup_name, effect_label = NA_character_,
+                          pct_change = NA_real_, pct_ci_lo = NA_real_,
+                          pct_ci_hi = NA_real_, p.value = NA_real_)
+
+  storm_sub <- df_sub |>
+    dplyr::filter(County != 99, threshold_knots == thresh) |>
+    dplyr::rename(ahca_code = County) |>
+    dplyr::mutate(effect = dplyr::case_when(
+      Window == "Threat_7d"                                    ~ "Threat",
+      Window == "Landfall_Day0"                                ~ "Impact",
+      !is.na(PostWeek) & PostWeek >= 1 & PostWeek <= n_cleanup ~ "Cleanup",
+      TRUE                                                     ~ NA_character_)) |>
+    dplyr::filter(!is.na(effect), lubridate::month(window_start) %in% 5:11) |>
+    dplyr::mutate(year_month = as.character(lubridate::floor_date(window_start, "month")),
+                  county_fe  = factor(as.integer(ahca_code))) |>
+    dplyr::select(ahca_code, county_fe, Visits, window_days, effect, window_start, year_month)
+
+  none_sub <- age_ns |>
+    dplyr::filter(SubgroupCol == subgroup_name) |>
+    dplyr::mutate(week_sun = week_mon - 1L) |>
+    dplyr::left_join(storm_active_weeks_sun, by = c("ahca_code", "week_sun")) |>
+    dplyr::filter(is.na(storm_active)) |>
+    dplyr::select(-storm_active, -week_sun) |>
+    dplyr::filter(lubridate::month(week_mon) %in% 5:11, week_mon <= none_end_date) |>
+    dplyr::mutate(effect       = "None",
+                  window_days  = 7L,
+                  window_start = week_mon,
+                  year_month   = as.character(lubridate::floor_date(week_mon, "month")),
+                  county_fe    = factor(as.integer(ahca_code))) |>
+    dplyr::select(ahca_code, county_fe, Visits, window_days, effect, window_start, year_month)
+  if (nrow(none_sub) == 0 | nrow(storm_sub) == 0) return(empty)
+
+  panel <- dplyr::bind_rows(storm_sub, none_sub) |>
+    dplyr::mutate(effect     = factor(effect, levels = c("None", "Cleanup", "Threat", "Impact")),
+                  year_month = factor(year_month),
+                  county_fe  = factor(as.integer(ahca_code)))
+  if (nrow(panel) < 50 || length(unique(panel$effect)) < 2) return(empty)
+
+  fit <- tryCatch(
+    fixest::fepois(Visits ~ i(effect, ref = "None") | county_fe + year_month,
+                   offset  = ~ log(window_days),
+                   data    = panel,
+                   cluster = ~ county_fe + year_month),
+    error = function(e) NULL)
+  if (is.null(fit)) return(empty)
+
+  broom::tidy(fit, conf.int = TRUE) |>
+    dplyr::filter(grepl("effect", term)) |>
+    dplyr::mutate(Subgroup     = subgroup_name,
+                  effect_label = stringr::str_extract(term, "(?<=::)[A-Za-z]+"),
+                  pct_change   = 100 * (exp(estimate) - 1),
+                  pct_ci_lo    = 100 * (exp(conf.low) - 1),
+                  pct_ci_hi    = 100 * (exp(conf.high) - 1)) |>
+    dplyr::select(Subgroup, effect_label, pct_change, pct_ci_lo, pct_ci_hi, p.value)
+}
+
+age_results_all <- list()
+for (th in thresholds) {
+  mask_days <- build_disease_mask(th, n_cleanup_weeks)
+  storm_active_weeks_sun <- mask_days |>
+    dplyr::distinct(ahca_code, week_sun) |>
+    dplyr::mutate(storm_active = TRUE)
+  age_results_all[[as.character(th)]] <- age_df |>
+    dplyr::group_by(SubgroupCol) |>
+    dplyr::group_split() |>
+    purrr::map_dfr(fit_age_model, thresh = th, n_cleanup = n_cleanup_weeks) |>
+    dplyr::mutate(threshold_knots = th)
+}
+age_results_all <- dplyr::bind_rows(age_results_all)
+
+storm_active_weeks_sun <- storm_active_weeks_sun_main
+```
+
+Figure 4
+```{r, fig.width=10, fig.height=5.5}
+p_age_all <- age_results_all |>
+  dplyr::filter(!is.na(pct_change)) |>
+  dplyr::mutate(effect_label  = factor(effect_label, levels = c("Threat", "Impact", "Cleanup")),
+                threshold_lab = factor(sprintf("≥%d kt", threshold_knots),
+                                       levels = c("≥34 kt", "≥55 kt", "≥64 kt")),
+                Subgroup      = factor(as.character(Subgroup), levels = rev(age_levels))) |>
+  ggplot(aes(x = pct_change, y = Subgroup, colour = threshold_lab, shape = threshold_lab)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "gray55") +
+  geom_pointrange(aes(xmin = pct_ci_lo, xmax = pct_ci_hi),
+                  position = position_dodge(width = 0.9),
+                  size = 0.35, linewidth = 0.55) +
+  scale_colour_manual(values = c("≥34 kt" = "#0072B2", "≥55 kt" = "#D55E00", "≥64 kt" = "#009E73"),
+                      name = "Wind threshold") +
+  scale_shape_manual(values = c("≥34 kt" = 16, "≥55 kt" = 17, "≥64 kt" = 15),
+                     name = "Wind threshold") +
+  guides(colour = guide_legend(override.aes = list(linewidth = 1.1, size = 0.9))) +
+  scale_y_discrete(labels = c("Over 65" = "65 and older")) +   # display label only; the data group stays "Over 65"
+  facet_wrap(~ effect_label, ncol = 3, scales = "free_x") +
+  labs(x = "% change in weekly ED encounters vs non-TC baseline", y = NULL,
+       caption = "Points: Poisson FE estimates; bars: 95% CIs") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold"),
+        panel.grid.major.x = element_line(colour = "grey92", linewidth = 0.25),
+        panel.grid.major.y = element_line(colour = "grey88", linewidth = 0.3),
+        panel.spacing.x = grid::unit(1.4, "lines"))
+p_age_all
+
+ggsave(file.path(fig_dir, "Figure4_age_groups_by_threshold.png"), p_age_all,
+       width = 11, height = 5.5, dpi = 300, bg = "white")
+p_age_pdf <- jesee_lines(p_age_all, 0.85) + labs(caption = NULL) +
+  theme(axis.title.x = element_text(size = 10.5), legend.title = element_text(size = 10.5),
+        panel.grid.major.x = element_line(linewidth = 0.85),
+        panel.grid.major.y = element_line(linewidth = 0.85))
+ggsave(file.path(fig_dir, "Figure4_age_groups_by_threshold.pdf"), p_age_pdf,
+       width = 11, height = 5.5, device = cairo_pdf, bg = "white")
+```
+
+## Exposure examples (Figure 1)
+
+Two worked examples of the exposure rule at ≥34 kt: Ian (2022) crosses the peninsula and Michael (2018) strikes the Panhandle. Each map shows the track, the RMW swath, and the counties the swath intersects. The swath is built the same way as in the lookup above.
+```{r, fig.width=11, fig.height=7}
+fig_thresh <- 34L
+fig_storms <- tibble::tribble(
+  ~sid,            ~label,
+  "2022266N12294", "Ian (2022)",
+  "2018280N18273", "Michael (2018)")
+
+fig_build <- function(sid, label) {
+  tr <- Tracks.sf |>
+    dplyr::filter(SID == sid, USA_WIND >= fig_thresh) |>
+    dplyr::select(SID, USA_WIND, USA_PRES, USA_RMW) |>
+    dplyr::group_by(SID) |>
+    dplyr::mutate(USA_RMW = ifelse(is.na(USA_RMW), mean(USA_RMW, na.rm = TRUE), USA_RMW)) |>
+    dplyr::group_by(USA_PRES) |>
+    dplyr::mutate(USA_RMW = ifelse(is.na(USA_RMW), mean(USA_RMW, na.rm = TRUE), USA_RMW)) |>
+    dplyr::group_by(SID) |>
+    dplyr::mutate(USA_RMW = ifelse(is.na(USA_RMW), mean(USA_RMW, na.rm = TRUE), USA_RMW)) |>
+    dplyr::ungroup() |>
+    dplyr::filter(!is.na(USA_RMW))
+  sw <- sf::st_buffer(tr, dist = tr$USA_RMW * 1852) |>
+    sf::st_union() |>
+    sf::st_sf(geometry = _)
+  hit <- counties_utm.sf$ahca_code[lengths(sf::st_intersects(counties_utm.sf, sw)) > 0]
+  list(track = sf::st_sf(geometry = sf::st_union(tr)) |> dplyr::mutate(storm = label),
+       swath = sw |> dplyr::mutate(storm = label),
+       hit   = hit, label = label)
+}
+fig_parts <- purrr::map2(fig_storms$sid, fig_storms$label, fig_build)
+
+fig_extent <- sf::st_bbox(counties_utm.sf)
+
+for (p in fig_parts) {
+  gp <- ggplot() +
+    geom_sf(data = counties_utm.sf |>
+              dplyr::mutate(exposed = ifelse(ahca_code %in% p$hit, "Exposed", "Not exposed")),
+            aes(fill = exposed), colour = "grey45", linewidth = 0.18) +
+    geom_sf(data = p$swath, fill = "#0072B2", alpha = 0.22, colour = "#0072B2", linewidth = 0.5) +
+    geom_sf(data = p$track, colour = "grey15", linewidth = 0.7) +
+    scale_fill_manual(values = c("Exposed" = "#F6C9A8", "Not exposed" = "grey93"), name = NULL) +
+    coord_sf(xlim = fig_extent[c("xmin", "xmax")], ylim = fig_extent[c("ymin", "ymax")]) +
+    labs(title = p$label) +
+    theme_void(base_size = 11) +
+    theme(legend.position = "bottom",
+          plot.title = element_text(face = "bold", size = 12, hjust = 0.5))
+  print(gp)
+  ggsave(file.path(fig_dir, sprintf("Figure1_exposure_%s.png", gsub("[^A-Za-z0-9]", "", p$label))),
+         gp, width = 6.5, height = 6.4, dpi = 300, bg = "white")
+  cat(p$label, "exposed counties:", length(p$hit), "\n")
+}
+```
+
+## Storm counts and ED volume by county (Figures S1 and S2)
+
+Storm-phase observations and None weeks at one threshold, built the same way as in the models. Rows without an encounter count (2004 storms whose phase weeks come before the ED data) are dropped. The analyzed storms are the storms that contribute phase rows with data.
+```{r}
+map_phase_obs <- function(th) {
+  ED_allcause |>
+    dplyr::filter(County != 99, threshold_knots == th, !is.na(Visits)) |>
+    dplyr::mutate(effect = dplyr::case_when(
+      Window == "Threat_7d"                                          ~ "Threat",
+      Window == "Landfall_Day0"                                      ~ "Impact",
+      !is.na(PostWeek) & PostWeek >= 1 & PostWeek <= n_cleanup_weeks ~ "Cleanup",
+      TRUE                                                           ~ NA_character_)) |>
+    dplyr::filter(!is.na(effect), lubridate::month(window_start) %in% 5:11) |>
+    dplyr::rename(ahca_code = County) |>
+    dplyr::group_by(ahca_code, window_start, effect) |>
+    dplyr::slice_max(Visits, n = 1, with_ties = FALSE) |>
+    dplyr::ungroup()
+}
+
+map_none_weeks <- function(th) {
+  mask_t <- build_disease_mask(th, n_cleanup_weeks) |>
+    dplyr::distinct(ahca_code, week_mon) |>
+    dplyr::mutate(storm_active = TRUE)
+  weekly_allcause_ns |>
+    dplyr::filter(Visits > 42, week_mon <= none_end_date) |>
+    dplyr::left_join(mask_t, by = c("ahca_code", "week_mon")) |>
+    dplyr::filter(is.na(storm_active)) |>
+    dplyr::filter(lubridate::month(week_mon) %in% 5:11)
+}
+
+analyzed_sids <- lapply(thresholds, function(th) sort(unique(map_phase_obs(th)$SID)))
+names(analyzed_sids) <- thresholds
+lengths(analyzed_sids)
+```
+
+Figure S2 counts the analyzed storms whose swath intersects each county. The three thresholds share one binned color scale, so the paler ≥55 and ≥64 kt maps show that hurricane-force exposure is rarer.
+```{r}
+storm_counts <- swath_county |>
+  dplyr::filter(SID %in% unlist(analyzed_sids)) |>
+  dplyr::filter(purrr::map2_lgl(SID, threshold_knots,
+                                ~ .x %in% analyzed_sids[[as.character(.y)]])) |>
+  dplyr::left_join(ahca_fips, by = "ahca_code") |>
+  dplyr::count(county_fips, threshold = threshold_knots, name = "n_storms")
+
+s1_df <- tidyr::crossing(county_fips = fl_counties_geo$county_fips, threshold = thresholds) |>
+  dplyr::left_join(storm_counts, by = c("county_fips", "threshold")) |>
+  dplyr::mutate(n_storms = tidyr::replace_na(n_storms, 0L),
+                threshold_lab = factor(paste0("≥", threshold, " kt"),
+                                       levels = paste0("≥", thresholds, " kt")))
+
+ylorrd   <- c("#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026")
+s1_brk   <- seq(0, ceiling(max(s1_df$n_storms) / 3) * 3, by = 3)
+s1_scale <- scale_fill_stepsn(colours = ylorrd, breaks = s1_brk,
+                              limits = range(s1_brk), show.limits = TRUE,
+                              name = "TCs,\n2005–2023")
+map_theme <- list(theme_void(base_size = 12),
+                  theme(strip.text = element_text(face = "bold")))
+
+p_s1a <- ggplot(fl_counties_geo |>
+                  dplyr::inner_join(dplyr::filter(s1_df, threshold == 34L), by = "county_fips")) +
+  geom_sf(aes(fill = n_storms), color = "white", linewidth = 0.2) +
+  s1_scale +
+  labs(caption = sprintf("TC Counts 2005–2023 (≥34kt, n = %d)", length(analyzed_sids[["34"]]))) +
+  map_theme
+p_s1a
+ggsave(file.path(fig_dir, "FigureS2a_TC_counts_34kt.png"), p_s1a,
+       width = 6.5, height = 5.5, dpi = 300, bg = "white")
+
+p_s1b <- ggplot(fl_counties_geo |>
+                  dplyr::inner_join(dplyr::filter(s1_df, threshold %in% c(55L, 64L)),
+                                    by = "county_fips")) +
+  geom_sf(aes(fill = n_storms), color = "white", linewidth = 0.2) +
+  facet_wrap(~ threshold_lab, nrow = 1) +
+  s1_scale +
+  labs(caption = sprintf("TC Counts 2005–2023 (≥55kt n = %d)(≥64kt n = %d)",
+                         length(analyzed_sids[["55"]]), length(analyzed_sids[["64"]]))) +
+  map_theme
+p_s1b
+ggsave(file.path(fig_dir, "FigureS2b_TC_counts_55_64kt.png"), p_s1b,
+       width = 9, height = 4.5, dpi = 300, bg = "white")
+
+s1_df |>
+  dplyr::group_by(threshold) |>
+  dplyr::summarize(min = min(n_storms), max = max(n_storms), n_zero_counties = sum(n_storms == 0))
+```
+
+Figure S1 is the mean weekly all-cause ED volume per county over the hurricane-season weeks.
+```{r}
+ed_volume <- weekly_allcause_ns |>
+  dplyr::filter(week_mon <= none_end_date, lubridate::month(week_mon) %in% 5:11) |>
+  dplyr::group_by(ahca_code) |>
+  dplyr::summarize(mean_weekly = mean(Visits), .groups = "drop") |>
+  dplyr::left_join(ahca_fips, by = "ahca_code")
+
+p_s2 <- ggplot(fl_counties_geo |> dplyr::left_join(ed_volume, by = "county_fips")) +
+  geom_sf(aes(fill = mean_weekly), color = "white", linewidth = 0.2) +
+  scale_fill_viridis_c(name = "Mean weekly\nED encounters", trans = "log10",
+                       labels = function(x) format(round(x), big.mark = ",", scientific = FALSE)) +
+  labs(caption = "Hurricane-season county-weeks, 2005–2023 (log color scale)") +
+  theme_void(base_size = 12)
+p_s2
+ggsave(file.path(fig_dir, "FigureS1_ED_volume.png"), p_s2,
+       width = 6.5, height = 5.5, dpi = 300, bg = "white")
+```
+
+## County phase effects (Figure 5)
+
+For each county and phase, compare the observed encounters with the encounters expected from the county's None weeks in the same year-month (or the same year when that month has no None week). The expected count is the per-day None rate times the window length.
+```{r, fig.width=10, fig.height=9}
+phase_ratio <- purrr::map_dfr(thresholds, function(th) {
+  ph <- map_phase_obs(th) |>
+    dplyr::mutate(year_month = as.character(lubridate::floor_date(window_start, "month")),
+                  yr         = lubridate::year(window_start))
+  none <- map_none_weeks(th) |>
+    dplyr::mutate(year_month = as.character(lubridate::floor_date(week_mon, "month")),
+                  yr         = lubridate::year(week_mon))
+  exp_ym <- none |>
+    dplyr::group_by(ahca_code, year_month) |>
+    dplyr::summarize(exp_daily_ym = sum(Visits) / (7 * dplyr::n()), .groups = "drop")
+  exp_yr <- none |>
+    dplyr::group_by(ahca_code, yr) |>
+    dplyr::summarize(exp_daily_yr = sum(Visits) / (7 * dplyr::n()), .groups = "drop")
+  ph |>
+    dplyr::left_join(exp_ym, by = c("ahca_code", "year_month")) |>
+    dplyr::left_join(exp_yr, by = c("ahca_code", "yr")) |>
+    dplyr::mutate(exp_daily = dplyr::coalesce(exp_daily_ym, exp_daily_yr)) |>
+    dplyr::filter(!is.na(exp_daily)) |>
+    dplyr::group_by(ahca_code, effect) |>
+    dplyr::summarize(obs = sum(Visits), expct = sum(exp_daily * window_days), .groups = "drop") |>
+    dplyr::mutate(pct_diff = 100 * (obs / expct - 1), threshold = th)
+})
+
+s3_sf <- fl_counties_geo |>
+  dplyr::inner_join(
+    tidyr::crossing(ahca_fips |> dplyr::select(ahca_code, county_fips),
+                    threshold = thresholds,
+                    effect = c("Threat", "Impact", "Cleanup")) |>
+      dplyr::left_join(phase_ratio, by = c("ahca_code", "threshold", "effect")) |>
+      dplyr::mutate(effect        = factor(effect, levels = c("Threat", "Impact", "Cleanup")),
+                    threshold_lab = factor(paste0("≥", threshold, " kt"),
+                                           levels = paste0("≥", thresholds, " kt"))),
+    by = "county_fips")
+
+# Counties crossed by a corridor at a threshold but without a reportable count in a phase are hatched
+# (at >=64 kt: Glades and Lafayette, Impact phase); counties not crossed at that threshold stay gray.
+s3_crossed <- phase_ratio |> dplyr::distinct(ahca_code, threshold)
+s3_nocount <- s3_sf |>
+  dplyr::filter(is.na(pct_diff)) |>
+  dplyr::semi_join(s3_crossed, by = c("ahca_code", "threshold"))
+hatch_sf <- function(poly, spacing = 9000) {  # diagonal lines clipped to the polygons, in metres (EPSG:3086)
+  pp   <- sf::st_transform(poly, 3086)
+  bb   <- sf::st_bbox(pp)
+  span <- max(bb[["xmax"]] - bb[["xmin"]], bb[["ymax"]] - bb[["ymin"]])
+  offs <- seq(-span, span, by = spacing)
+  lns  <- sf::st_sfc(lapply(offs, function(o) sf::st_linestring(matrix(
+            c(bb[["xmin"]] + o, bb[["ymin"]], bb[["xmin"]] + o + span, bb[["ymin"]] + span), ncol = 2, byrow = TRUE))),
+            crs = 3086)
+  h <- suppressWarnings(sf::st_intersection(pp, sf::st_sf(geometry = lns)))
+  sf::st_transform(h, sf::st_crs(poly))
+}
+s3_hatch <- if (nrow(s3_nocount) > 0) hatch_sf(s3_nocount) else NULL
+
+s3_stops <- c(-25, -12, -6, -2.5, 0, 2.5, 6, 12, 25)  # dense near zero, sparse in the tails
+
+p_s3 <- ggplot(s3_sf) +
+  geom_sf(aes(fill = pct_diff), color = "grey40", linewidth = 0.12) +
+  list(if (!is.null(s3_hatch)) geom_sf(data = s3_nocount, fill = "white", color = "grey40", linewidth = 0.12),
+       if (!is.null(s3_hatch)) geom_sf(data = s3_hatch, color = "grey15", linewidth = 0.3)) +
+  facet_grid(threshold_lab ~ effect) +
+  scale_fill_gradientn(
+    colours = c("#2166ac", "#4393c3", "#92c5de", "#d1e5f0", "#f7f7f7",
+                "#fddbc7", "#f4a582", "#d6604d", "#b2182b"),
+    values  = scales::rescale(s3_stops, from = c(-25, 25)),
+    limits  = c(-25, 25), oob = scales::squish,
+    breaks  = c(-25, -12, -6, 0, 6, 12, 25),
+    name    = "% difference\nvs expected",
+    na.value = "gray85",
+    guide = guide_colourbar(barheight = grid::unit(5, "cm"))) +
+  labs(caption = "All-cause, RMW corridor exposure. Gray: not exposed at that threshold; hatched: exposed, no reportable count; colors capped at ±25%") +
+  theme_void(base_size = 12) +
+  theme(strip.text = element_text(face = "bold"), legend.position = "right")
+p_s3
+ggsave(file.path(fig_dir, "Figure5_county_phase_vs_expected.png"), p_s3,
+       width = 10, height = 9, dpi = 300, bg = "white")
+p_s3_pdf <- jesee_lines(p_s3, 0.75) + labs(caption = NULL) +
+  theme(legend.title = element_text(size = 9.8),
+        legend.ticks = element_line(colour = "white", linewidth = 0.75)) +
+  guides(fill = guide_colourbar(barheight = grid::unit(5, "cm"), display = "gradient"))
+hatch_i <- which(vapply(p_s3_pdf$layers, function(l) identical(l$data, s3_hatch), logical(1)))
+if (length(hatch_i) == 1) p_s3_pdf$layers[[hatch_i]]$data <- hatch_sf(s3_nocount, spacing = 15000)  # wider spacing so 1 pt hatch lines stay open
+ggsave(file.path(fig_dir, "Figure5_county_phase_vs_expected.pdf"), p_s3_pdf,
+       width = 10, height = 9, device = cairo_pdf, bg = "white")
+
+phase_ratio |>
+  dplyr::group_by(threshold, effect) |>
+  dplyr::summarize(counties = dplyr::n(),
+                   min = round(min(pct_diff), 1),
+                   median = round(median(pct_diff), 1),
+                   max = round(max(pct_diff), 1), .groups = "drop") |>
+  as.data.frame()
+```
+
+The geography statements in the Results come from the county values behind Figure 5. Counties are classified as metropolitan (USDA Rural-Urban Continuum Codes 1–3) or nonmetropolitan (codes 4–9).
+```{r}
+rucc <- readr::read_csv(rucc_file, show_col_types = FALSE) |>
+  dplyr::filter(State == "FL") |>
+  dplyr::select(FIPS, Attribute, Value) |>
+  tidyr::pivot_wider(names_from = Attribute, values_from = Value) |>
+  dplyr::transmute(county_fips = sprintf("%05d", as.integer(FIPS)),
+                   RUCC = as.integer(RUCC_2023),
+                   nonmetro = RUCC >= 4)
+
+geo <- phase_ratio |>
+  dplyr::left_join(ahca_fips, by = "ahca_code") |>
+  dplyr::left_join(rucc, by = "county_fips")
+stopifnot(!anyNA(geo$RUCC))
+
+# Impact: counties at or above expected
+geo |>
+  dplyr::filter(effect == "Impact", pct_diff >= 0) |>
+  dplyr::arrange(threshold, dplyr::desc(pct_diff)) |>
+  dplyr::transmute(threshold, county_name, RUCC, obs, expected = round(expct),
+                   pct_diff = round(pct_diff, 1)) |>
+  as.data.frame()
+
+# Cleanup: same counties at >=34 and >=64 kt
+cl <- geo |> dplyr::filter(effect == "Cleanup")
+both <- cl |>
+  dplyr::select(county_name, threshold, pct_diff) |>
+  tidyr::pivot_wider(names_from = threshold, values_from = pct_diff, names_prefix = "kt") |>
+  dplyr::filter(!is.na(kt34), !is.na(kt64))
+c(counties = nrow(both), larger_at_64 = sum(both$kt64 > both$kt34))
+
+# Cleanup: metropolitan vs nonmetropolitan counties
+purrr::map_dfr(thresholds, function(th) {
+  x <- cl |> dplyr::filter(threshold == th)
+  tibble::tibble(threshold = th,
+                 median_metro    = median(x$pct_diff[!x$nonmetro]),
+                 median_nonmetro = median(x$pct_diff[x$nonmetro]),
+                 wilcoxon_p      = suppressWarnings(wilcox.test(pct_diff ~ nonmetro, data = x))$p.value)
+}) |>
+  as.data.frame()
+
+# Cleanup: largest increases at >=64 kt
+cl |>
+  dplyr::filter(threshold == 64) |>
+  dplyr::arrange(dplyr::desc(pct_diff)) |>
+  head(10) |>
+  dplyr::transmute(county_name, metro = ifelse(nonmetro, "nonmetro", "metro"),
+                   pct_diff = round(pct_diff, 1)) |>
+  as.data.frame()
+```
+
+## Attributable fraction and number (Table 1)
+
+The attributable fraction is AF = 1 − exp(−β) and the attributable number is AN = n × AF, where β is the phase coefficient and n is the number of encounters observed in that phase at ≥34 kt (Gasparrini & Leone 2014). Confidence limits come from the limits of β. The all-cause β comes from `m_allcause`. The cause-specific β is recovered from the percent change, β = log(1 + %/100), which is exact. Impact coverage is the share of exposed county-storm pairs (those with a Threat row) that also have an Impact row; suppressed single-day cells are absent from the provider files.
+```{r}
+ar_threshold <- 34L
+
+phase_n <- function(df) {
+  df |>
+    dplyr::filter(County != 99, threshold_knots == ar_threshold) |>
+    dplyr::mutate(effect_label = dplyr::case_when(
+      Window == "Threat_7d"                                          ~ "Threat",
+      Window == "Landfall_Day0"                                      ~ "Impact",
+      !is.na(PostWeek) & PostWeek >= 1 & PostWeek <= n_cleanup_weeks ~ "Cleanup",
+      TRUE                                                           ~ NA_character_)) |>
+    dplyr::filter(!is.na(effect_label), lubridate::month(window_start) %in% 5:11) |>
+    dplyr::group_by(effect_label) |>
+    dplyr::summarize(n = sum(Visits, na.rm = TRUE), .groups = "drop")
+}
+
+ar_allcause <- broom::tidy(m_allcause, conf.int = TRUE) |>
+  dplyr::filter(grepl("effect", term)) |>
+  dplyr::transmute(Outcome = "All-cause",
+                   effect_label = stringr::str_extract(term, "(?<=::)[A-Za-z]+"),
+                   beta = estimate, beta_lo = conf.low, beta_hi = conf.high, p.value) |>
+  dplyr::left_join(phase_n(ED_allcause), by = "effect_label")
+
+ar_category <- disease_results_all |>
+  dplyr::filter(threshold_knots == ar_threshold, !is.na(effect_label)) |>
+  dplyr::transmute(Outcome = cat_labels[Category], Category, effect_label,
+                   beta = log(1 + pct_change / 100),
+                   beta_lo = log(1 + pct_ci_lo / 100),
+                   beta_hi = log(1 + pct_ci_hi / 100),
+                   p.value) |>
+  dplyr::left_join(ED_disease |>
+                     dplyr::group_by(Category) |>
+                     dplyr::group_modify(~ phase_n(.x)) |>
+                     dplyr::ungroup(),
+                   by = c("Category", "effect_label"))
+
+impact_coverage <- ED_disease |>
+  dplyr::filter(County != 99, threshold_knots == ar_threshold,
+                lubridate::month(window_start) %in% 5:11) |>
+  dplyr::group_by(Category) |>
+  dplyr::summarize(pairs        = dplyr::n_distinct(paste(SID, County)[Window == "Threat_7d"]),
+                   impact_pairs = dplyr::n_distinct(paste(SID, County)[Window == "Landfall_Day0"]),
+                   .groups = "drop") |>
+  dplyr::transmute(Outcome = cat_labels[Category],
+                   impact_coverage_pct = round(100 * impact_pairs / pairs))
+
+attributable_risk <- dplyr::bind_rows(ar_allcause, ar_category |> dplyr::select(-Category)) |>
+  dplyr::mutate(AF    = 100 * (1 - exp(-beta)),
+                AF_lo = 100 * (1 - exp(-beta_lo)),
+                AF_hi = 100 * (1 - exp(-beta_hi)),
+                AN    = n * AF / 100,
+                AN_lo = n * AF_lo / 100,
+                AN_hi = n * AF_hi / 100) |>
+  dplyr::left_join(impact_coverage, by = "Outcome")
+
+comma <- function(x) format(round(x), big.mark = ",", trim = TRUE)
+
+attributable_risk |>
+  dplyr::mutate(effect_label = factor(effect_label, levels = c("Threat", "Impact", "Cleanup")),
+                Outcome = factor(Outcome, levels = c("All-cause", "Injuries", "Respiratory",
+                                                     "Infectious disease", "Neuropsychiatric",
+                                                     "Digestive", "Cardiovascular", "Endocrine",
+                                                     "Renal", "Diabetes", "Neoplasms"))) |>
+  dplyr::arrange(Outcome, effect_label) |>
+  dplyr::transmute(Outcome, phase = effect_label, n = comma(n),
+                   AF = sprintf("%+.1f%%", AF),
+                   AN = sprintf("%s (%s to %s)", comma(AN), comma(AN_lo), comma(AN_hi)),
+                   p = signif(p.value, 2),
+                   impact_coverage = ifelse(effect_label == "Impact",
+                                            paste0(impact_coverage_pct, "%"), "")) |>
+  as.data.frame()
+```
+
+## Attributable fraction and number at ≥64 kt (Table 2)
+
+The same calculation at ≥64 kt, where the Cleanup increases are largest; Table 1 above is unchanged. The all-cause β is the ≥64 kt estimate from Figure 2 (`fig_dat`) and the cause-specific β comes from `disease_results_all`, both recovered from the percent change, β = log(1 + %/100), which is exact. The phase totals n and the Impact coverage are counted at ≥64 kt. Run at ≥34 kt, this function reproduces Table 1.
+```{r}
+attributable_at <- function(th) {
+  phase_n_th <- function(df) {
+    df |>
+      dplyr::filter(County != 99, threshold_knots == th) |>
+      dplyr::mutate(effect_label = dplyr::case_when(
+        Window == "Threat_7d"                                          ~ "Threat",
+        Window == "Landfall_Day0"                                      ~ "Impact",
+        !is.na(PostWeek) & PostWeek >= 1 & PostWeek <= n_cleanup_weeks ~ "Cleanup",
+        TRUE                                                           ~ NA_character_)) |>
+      dplyr::filter(!is.na(effect_label), lubridate::month(window_start) %in% 5:11) |>
+      dplyr::group_by(effect_label) |>
+      dplyr::summarize(n = sum(Visits, na.rm = TRUE), .groups = "drop")
+  }
+  from_pct <- function(df) df |>
+    dplyr::mutate(beta = log(1 + pct_change / 100), beta_lo = log(1 + pct_ci_lo / 100),
+                  beta_hi = log(1 + pct_ci_hi / 100))
+
+  ac <- fig_dat |>
+    dplyr::filter(as.integer(gsub("\\D", "", as.character(threshold))) == th) |>
+    from_pct() |>
+    dplyr::transmute(Outcome = "All-cause", effect_label = as.character(effect_label),
+                     beta, beta_lo, beta_hi, p.value) |>
+    dplyr::left_join(phase_n_th(ED_allcause), by = "effect_label")
+
+  cs <- disease_results_all |>
+    dplyr::filter(threshold_knots == th, !is.na(effect_label)) |>
+    from_pct() |>
+    dplyr::transmute(Outcome = cat_labels[Category], Category, effect_label,
+                     beta, beta_lo, beta_hi, p.value) |>
+    dplyr::left_join(ED_disease |>
+                       dplyr::group_by(Category) |>
+                       dplyr::group_modify(~ phase_n_th(.x)) |>
+                       dplyr::ungroup(),
+                     by = c("Category", "effect_label"))
+
+  coverage <- ED_disease |>
+    dplyr::filter(County != 99, threshold_knots == th,
+                  lubridate::month(window_start) %in% 5:11) |>
+    dplyr::group_by(Category) |>
+    dplyr::summarize(pairs        = dplyr::n_distinct(paste(SID, County)[Window == "Threat_7d"]),
+                     impact_pairs = dplyr::n_distinct(paste(SID, County)[Window == "Landfall_Day0"]),
+                     .groups = "drop") |>
+    dplyr::transmute(Outcome = cat_labels[Category],
+                     impact_coverage_pct = round(100 * impact_pairs / pairs))
+
+  dplyr::bind_rows(ac, cs |> dplyr::select(-Category)) |>
+    dplyr::mutate(AF    = 100 * (1 - exp(-beta)),
+                  AF_lo = 100 * (1 - exp(-beta_lo)),
+                  AF_hi = 100 * (1 - exp(-beta_hi)),
+                  AN    = n * AF / 100,
+                  AN_lo = n * AF_lo / 100,
+                  AN_hi = n * AF_hi / 100) |>
+    dplyr::left_join(coverage, by = "Outcome")
+}
+
+# check: at ≥34 kt the function must reproduce Table 1
+chk_34 <- attributable_at(34L) |>
+  dplyr::inner_join(attributable_risk, by = c("Outcome", "effect_label"))
+stopifnot(nrow(chk_34) == nrow(attributable_risk),
+          max(abs(c(chk_34$AN.x - chk_34$AN.y, chk_34$AF.x - chk_34$AF.y))) < 1e-6)
+
+attributable_risk_64 <- attributable_at(64L)
+
+attributable_risk_64 |>
+  dplyr::mutate(effect_label = factor(effect_label, levels = c("Threat", "Impact", "Cleanup")),
+                Outcome = factor(Outcome, levels = c("All-cause", "Injuries", "Respiratory",
+                                                     "Infectious disease", "Neuropsychiatric",
+                                                     "Digestive", "Cardiovascular", "Endocrine",
+                                                     "Renal", "Diabetes", "Neoplasms"))) |>
+  dplyr::arrange(Outcome, effect_label) |>
+  dplyr::transmute(Outcome, phase = effect_label, n = comma(n),
+                   AF = sprintf("%+.1f%%", AF),
+                   AN = sprintf("%s (%s to %s)", comma(AN), comma(AN_lo), comma(AN_hi)),
+                   p = signif(p.value, 2),
+                   impact_coverage = ifelse(effect_label == "Impact",
+                                            paste0(impact_coverage_pct, "%"), "")) |>
+  as.data.frame()
+```
+
+## Threat phase without a swath (Note used)
+
+The Discussion compares the Threat phase across the swath definition. Two models are fit at each threshold with the statewide file, which assigns every storm's phases to all 67 counties. The first ignores the swath: every county is exposed to every storm. The second splits the Threat phase into counties inside the swath (ThreatIn) and counties outside it (ThreatOut); the Impact and Cleanup phases stay inside the swath. A county-week that is a Threat week for one storm inside its swath and for another storm outside its swath is counted as inside. In both models the storm-active weeks for every county are removed from the None weeks.
+```{r}
+statewide_threat <- purrr::map_dfr(thresholds, fit_allcause_threshold,
+                                   threat_window = "Threat_7d",
+                                   n_cleanup     = n_cleanup_weeks,
+                                   ed            = ED_allcause_state) |>
+  dplyr::mutate(exposure = "All counties (no swath)")
+
+fit_threat_inside_outside <- function(thresh) {
+  in_swath <- swath_county |>
+    dplyr::filter(threshold_knots == thresh) |>
+    dplyr::transmute(SID, ahca_code, in_swath = TRUE)
+
+  storm_obs_t <- ED_allcause_state |>
+    dplyr::filter(County != 99, threshold_knots == thresh) |>
+    dplyr::mutate(phase = dplyr::case_when(
+      Window == "Threat_7d"                                          ~ "Threat",
+      Window == "Landfall_Day0"                                      ~ "Impact",
+      !is.na(PostWeek) & PostWeek >= 1 & PostWeek <= n_cleanup_weeks ~ "Cleanup",
+      TRUE                                                           ~ NA_character_)) |>
+    dplyr::filter(!is.na(phase), lubridate::month(window_start) %in% 5:11) |>
+    dplyr::rename(ahca_code = County) |>
+    dplyr::left_join(in_swath, by = c("SID", "ahca_code")) |>
+    dplyr::mutate(in_swath = !is.na(in_swath)) |>
+    dplyr::filter(in_swath | phase == "Threat") |>
+    dplyr::group_by(ahca_code, window_start, phase) |>
+    dplyr::arrange(dplyr::desc(in_swath), dplyr::desc(Visits), .by_group = TRUE) |>
+    dplyr::slice(1) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(effect = dplyr::case_when(phase == "Threat" & in_swath ~ "ThreatIn",
+                                            phase == "Threat"            ~ "ThreatOut",
+                                            TRUE                         ~ phase),
+                  year_month = as.character(lubridate::floor_date(window_start, "month"))) |>
+    dplyr::select(ahca_code, Visits, window_days, effect, year_month)
+
+  mask_t <- build_disease_mask(thresh, n_cleanup_weeks, ed = ED_allcause_state) |>
+    dplyr::distinct(ahca_code, week_mon) |>
+    dplyr::mutate(storm_active = TRUE)
+
+  none_t <- weekly_allcause_ns |>
+    dplyr::filter(Visits > 42, week_mon <= none_end_date) |>
+    dplyr::left_join(mask_t, by = c("ahca_code", "week_mon")) |>
+    dplyr::filter(is.na(storm_active), lubridate::month(week_mon) %in% 5:11) |>
+    dplyr::transmute(ahca_code, Visits, window_days = 7L, effect = "None",
+                     year_month = as.character(lubridate::floor_date(week_mon, "month")))
+
+  panel_t <- dplyr::bind_rows(storm_obs_t, none_t) |>
+    dplyr::mutate(effect     = factor(effect, levels = c("None", "ThreatIn", "ThreatOut",
+                                                         "Impact", "Cleanup")),
+                  year_month = factor(year_month),
+                  county_fe  = factor(as.integer(ahca_code)))
+
+  fit <- fixest::fepois(
+    Visits ~ i(effect, ref = "None") | county_fe + year_month,
+    offset  = ~ log(window_days),
+    data    = panel_t,
+    cluster = ~ county_fe + year_month
+  )
+
+  b <- coef(fit)
+  V <- vcov(fit)
+  k <- c("effect::ThreatIn", "effect::ThreatOut")
+  d    <- unname(b[k[1]] - b[k[2]])
+  d_se <- sqrt(V[k[1], k[1]] + V[k[2], k[2]] - 2 * V[k[1], k[2]])
+
+  broom::tidy(fit, conf.int = TRUE) |>
+    dplyr::filter(term %in% k) |>
+    dplyr::transmute(threshold = thresh,
+                     effect_label = sub("effect::", "", term),
+                     n_obs = as.integer(table(panel_t$effect)[effect_label]),
+                     pct_change = 100 * (exp(estimate) - 1),
+                     pct_ci_lo  = 100 * (exp(conf.low) - 1),
+                     pct_ci_hi  = 100 * (exp(conf.high) - 1),
+                     p.value,
+                     in_minus_out_pct = 100 * (exp(d) - 1),
+                     in_vs_out_p      = 2 * pnorm(-abs(d / d_se)))
+}
+
+threat_inside_outside <- purrr::map_dfr(thresholds, fit_threat_inside_outside)
+
+statewide_threat |>
+  dplyr::filter(effect_label == "Threat") |>
+  as.data.frame()
+as.data.frame(threat_inside_outside)
+```
+
+## Falsification test (timing permutation)
+
+Each storm's impact date is moved to a random day in the same hurricane season (May–November of the same year) at least 16 days from the true date, the phase windows are rebuilt around the new date from the daily file, the storm-active weeks are removed from the None weeks, and the all-cause model is refit. This is repeated 200 times at ≥34 kt. The one-sided empirical p-value is the share of permuted estimates at least as extreme as the true estimate, (1 + count) / (200 + 1).
+```{r}
+set.seed(20250528)
+N_ITER <- 200
+placebo_threshold <- 34L
+
+daily_all <- readr::read_csv(daily_allcause_path, show_col_types = FALSE) |>
+  dplyr::mutate(Date = as.Date(Date), ahca_code = as.integer(County)) |>
+  dplyr::filter(ahca_code != 99,
+                Date >= as.Date(paste0(begin_year, "-01-01")),
+                Date <= as.Date(paste0(end_year, "-12-31")))
+
+storm_county_exposure <- ED_allcause |>
+  dplyr::filter(County != 99, threshold_knots == placebo_threshold) |>
+  dplyr::distinct(SID, County, impact_date) |>
+  dplyr::rename(ahca_code = County, true_impact = impact_date)
+
+true_coefs <- broom::tidy(m_allcause) |>
+  dplyr::filter(grepl("effect", term)) |>
+  dplyr::transmute(effect_label = stringr::str_extract(term, "(?<=::)[A-Za-z]+"),
+                   true_estimate = estimate,
+                   true_pct = 100 * (exp(estimate) - 1),
+                   true_p = p.value)
+
+run_temporal_permutation <- function(iter) {
+  randomized <- storm_county_exposure |>
+    dplyr::distinct(SID, true_impact) |>
+    dplyr::rowwise() |>
+    dplyr::mutate(yr           = lubridate::year(true_impact),
+                  season_start = as.Date(paste0(yr, "-05-01")),
+                  season_end   = as.Date(paste0(yr, "-11-30")),
+                  rand_impact  = {
+                    candidates <- seq(season_start, season_end, by = "day")
+                    candidates <- candidates[abs(as.integer(candidates - true_impact)) >= 16]
+                    if (length(candidates) == 0) true_impact else sample(candidates, 1)
+                  }) |>
+    dplyr::ungroup() |>
+    dplyr::select(SID, rand_impact)
+
+  storm_rand <- storm_county_exposure |>
+    dplyr::left_join(randomized, by = "SID")
+
+  all_windows <- dplyr::bind_rows(
+    storm_rand |> dplyr::mutate(window_start = rand_impact - 7L, window_end = rand_impact - 1L,
+                                effect = "Threat"),
+    storm_rand |> dplyr::mutate(window_start = rand_impact, window_end = rand_impact,
+                                effect = "Impact"),
+    storm_rand |> dplyr::mutate(window_start = rand_impact + 1L, window_end = rand_impact + 7L,
+                                effect = "Cleanup"))
+
+  storm_obs_rand <- all_windows |>
+    dplyr::inner_join(daily_all, by = "ahca_code", relationship = "many-to-many") |>
+    dplyr::filter(Date >= window_start, Date <= window_end) |>
+    dplyr::group_by(SID, ahca_code, effect, window_start, window_end) |>
+    dplyr::summarize(Visits = sum(Visits, na.rm = TRUE), window_days = n(), .groups = "drop") |>
+    dplyr::filter(lubridate::month(window_start) %in% 5:11) |>
+    dplyr::mutate(year_month = as.character(lubridate::floor_date(window_start, "month")),
+                  county_fe  = factor(as.integer(ahca_code))) |>
+    dplyr::select(ahca_code, county_fe, Visits, window_days, effect, window_start, year_month)
+
+  storm_active_rand <- all_windows |>
+    dplyr::rowwise() |>
+    dplyr::mutate(dates = list(seq(window_start, window_end, by = "day"))) |>
+    tidyr::unnest(dates) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(week_mon = as.Date(lubridate::floor_date(dates, unit = "week", week_start = 1))) |>
+    dplyr::distinct(ahca_code, week_mon) |>
+    dplyr::mutate(storm_active = TRUE)
+
+  none_rand <- daily_all |>
+    dplyr::mutate(week_mon = as.Date(lubridate::floor_date(Date, unit = "week", week_start = 1))) |>
+    dplyr::group_by(ahca_code, week_mon) |>
+    dplyr::summarize(Visits = sum(Visits, na.rm = TRUE), n_days = n(), .groups = "drop") |>
+    dplyr::filter(n_days == 7, Visits > 42, week_mon <= none_end_date) |>
+    dplyr::left_join(storm_active_rand, by = c("ahca_code", "week_mon")) |>
+    dplyr::filter(is.na(storm_active)) |>
+    dplyr::filter(lubridate::month(week_mon) %in% 5:11) |>
+    dplyr::mutate(effect       = "None",
+                  window_days  = 7L,
+                  window_start = week_mon,
+                  year_month   = as.character(lubridate::floor_date(week_mon, "month")),
+                  county_fe    = factor(as.integer(ahca_code))) |>
+    dplyr::select(ahca_code, county_fe, Visits, window_days, effect, window_start, year_month)
+
+  panel_rand <- dplyr::bind_rows(storm_obs_rand, none_rand) |>
+    dplyr::mutate(effect     = factor(effect, levels = c("None", "Cleanup", "Threat", "Impact")),
+                  year_month = factor(year_month),
+                  county_fe  = factor(as.integer(ahca_code)))
+  if (nrow(panel_rand) < 100) return(NULL)
+
+  fit <- tryCatch(
+    fixest::fepois(Visits ~ i(effect, ref = "None") | county_fe + year_month,
+                   offset  = ~ log(window_days),
+                   data    = panel_rand,
+                   cluster = ~ county_fe + year_month),
+    error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+
+  broom::tidy(fit) |>
+    dplyr::filter(grepl("effect", term)) |>
+    dplyr::transmute(iter = iter, type = "temporal",
+                     effect_label = stringr::str_extract(term, "(?<=::)[A-Za-z]+"),
+                     estimate, p.value)
+}
+
+temporal_coefs <- dplyr::bind_rows(lapply(seq_len(N_ITER), run_temporal_permutation))
+dplyr::n_distinct(temporal_coefs$iter)
+```
+
+Empirical p-values for the all-cause phases.
+```{r}
+placebo_summary <- temporal_coefs |>
+  dplyr::group_by(type, effect_label) |>
+  dplyr::summarize(n_iter   = n(),
+                   mean_est = mean(estimate, na.rm = TRUE),
+                   sd_est   = sd(estimate, na.rm = TRUE),
+                   p2_5     = quantile(estimate, 0.025, na.rm = TRUE),
+                   p97_5    = quantile(estimate, 0.975, na.rm = TRUE),
+                   .groups  = "drop")
+
+compute_emp_p <- function(permutation_estimates, true_estimate, n_iter) {
+  if (true_estimate >= 0) {
+    p_one <- (1 + sum(permutation_estimates >= true_estimate)) / (n_iter + 1)
+  } else {
+    p_one <- (1 + sum(permutation_estimates <= true_estimate)) / (n_iter + 1)
+  }
+  round(p_one, 3)
+}
+
+empirical_p <- temporal_coefs |>
+  dplyr::left_join(true_coefs |> dplyr::select(effect_label, true_estimate), by = "effect_label") |>
+  dplyr::group_by(type, effect_label) |>
+  dplyr::summarize(true_estimate  = unique(true_estimate),
+                   true_pct       = round(100 * (exp(unique(true_estimate)) - 1), 2),
+                   emp_p_onesided = compute_emp_p(estimate, unique(true_estimate), dplyr::n()),
+                   .groups = "drop")
+
+as.data.frame(empirical_p)
+```
+
+The same timing permutation for each cause-specific category. There are no daily category data, so the random impact weeks are drawn on the provider's Sunday week grid (same year, May–November, at least 16 days from the true date), and the pseudo-Threat and pseudo-Cleanup weeks are scored from the weekly file. The 1-day Impact phase cannot be moved on a weekly grid and is not tested.
+```{r}
+set.seed(4242)
+cat_placebo_threshold <- 34L
+
+sundays_of_year <- function(yr) {
+  s <- seq(as.Date(paste0(yr, "-05-01")), as.Date(paste0(yr, "-11-30")), by = "day")
+  s[lubridate::wday(s) == 1]
+}
+
+emp_p_cat <- function(placebo, true) {
+  placebo <- placebo[!is.na(placebo)]
+  if (length(placebo) == 0 || is.na(true)) return(NA_real_)
+  if (true >= 0) (sum(placebo >= true) + 1) / (length(placebo) + 1)
+  else           (sum(placebo <= true) + 1) / (length(placebo) + 1)
+}
+
+run_category_placebo <- function(cname) {
+  ns <- combined_ns |>
+    dplyr::filter(Category == cname) |>
+    dplyr::mutate(week_sun = week_mon - 1L) |>
+    dplyr::select(ahca_code, week_sun, Visits)
+  sa <- ED_disease |>
+    dplyr::filter(Category == cname, County != 99, threshold_knots == cat_placebo_threshold)
+
+  storm_counties <- sa |>
+    dplyr::filter(Window == "Threat_7d") |>
+    dplyr::transmute(SID, true_impact = as.Date(impact_date), ahca_code = as.integer(County)) |>
+    dplyr::distinct()
+  storms <- storm_counties |> dplyr::distinct(SID, true_impact)
+
+  storm_true <- sa |>
+    dplyr::mutate(effect = dplyr::case_when(
+      Window == "Threat_7d"                                          ~ "Threat",
+      !is.na(PostWeek) & PostWeek >= 1 & PostWeek <= n_cleanup_weeks ~ "Cleanup",
+      TRUE                                                           ~ NA_character_)) |>
+    dplyr::filter(!is.na(effect), lubridate::month(window_start) %in% 5:11) |>
+    dplyr::transmute(ahca_code = as.integer(County), Visits, window_days, effect,
+                     year_month = as.character(lubridate::floor_date(window_start, "month")))
+  none_true <- ns |>
+    dplyr::left_join(storm_active_weeks_sun, by = c("ahca_code", "week_sun")) |>
+    dplyr::filter(is.na(storm_active)) |>
+    dplyr::mutate(week_mon = week_sun + 1L) |>
+    dplyr::filter(lubridate::month(week_mon) %in% 5:11, week_mon <= none_end_date) |>
+    dplyr::transmute(ahca_code, Visits, window_days = 7L, effect = "None",
+                     year_month = as.character(lubridate::floor_date(week_mon, "month")))
+  panel_true <- dplyr::bind_rows(storm_true, none_true) |>
+    dplyr::mutate(effect = factor(effect, levels = c("None", "Cleanup", "Threat")),
+                  year_month = factor(year_month), county_fe = factor(ahca_code))
+
+  ft <- tryCatch(fixest::fepois(Visits ~ i(effect, ref = "None") | county_fe + year_month,
+                                offset = ~ log(window_days), data = panel_true,
+                                cluster = ~ county_fe + year_month),
+                 error = function(e) NULL)
+  if (is.null(ft)) return(NULL)
+  bt <- coef(ft)
+  tv <- c(Threat = unname(bt["effect::Threat"]), Cleanup = unname(bt["effect::Cleanup"]))
+
+  temporal_one <- function(i) {
+    rand <- storms |>
+      dplyr::rowwise() |>
+      dplyr::mutate(w0 = {
+        cand <- sundays_of_year(lubridate::year(true_impact))
+        cand <- cand[abs(as.integer(cand - true_impact)) >= 16 & cand + 7 <= none_end_date]
+        if (length(cand) == 0) as.Date(NA) else sample(cand, 1) }) |>
+      dplyr::ungroup() |>
+      dplyr::filter(!is.na(w0))
+    pseudo <- storm_counties |>
+      dplyr::inner_join(rand |> dplyr::select(SID, w0), by = "SID") |>
+      dplyr::mutate(threat_wk = w0 - 7L, cleanup_wk = w0 + 7L)
+    ps <- dplyr::bind_rows(
+      pseudo |> dplyr::transmute(ahca_code, week_sun = threat_wk,  effect = "Threat"),
+      pseudo |> dplyr::transmute(ahca_code, week_sun = cleanup_wk, effect = "Cleanup")) |>
+      dplyr::distinct(ahca_code, week_sun, effect) |>
+      dplyr::inner_join(ns, by = c("ahca_code", "week_sun")) |>
+      dplyr::mutate(week_mon = week_sun + 1L) |>
+      dplyr::filter(lubridate::month(week_mon) %in% 5:11) |>
+      dplyr::transmute(ahca_code, Visits, window_days = 7L, effect,
+                       year_month = as.character(lubridate::floor_date(week_mon, "month")))
+    pw <- dplyr::bind_rows(
+      pseudo |> dplyr::select(ahca_code, week_sun = threat_wk),
+      pseudo |> dplyr::select(ahca_code, week_sun = cleanup_wk)) |>
+      dplyr::distinct() |>
+      dplyr::mutate(is_pseudo = TRUE)
+    none_i <- ns |>
+      dplyr::left_join(storm_active_weeks_sun, by = c("ahca_code", "week_sun")) |>
+      dplyr::filter(is.na(storm_active)) |>
+      dplyr::left_join(pw, by = c("ahca_code", "week_sun")) |>
+      dplyr::filter(is.na(is_pseudo)) |>
+      dplyr::mutate(week_mon = week_sun + 1L) |>
+      dplyr::filter(lubridate::month(week_mon) %in% 5:11, week_mon <= none_end_date) |>
+      dplyr::transmute(ahca_code, Visits, window_days = 7L, effect = "None",
+                       year_month = as.character(lubridate::floor_date(week_mon, "month")))
+    p <- dplyr::bind_rows(ps, none_i) |>
+      dplyr::mutate(effect = factor(effect, levels = c("None", "Cleanup", "Threat")),
+                    year_month = factor(year_month), county_fe = factor(ahca_code))
+    f <- tryCatch(fixest::fepois(Visits ~ i(effect, ref = "None") | county_fe + year_month,
+                                 offset = ~ log(window_days), data = p,
+                                 cluster = ~ county_fe + year_month),
+                  error = function(e) NULL)
+    if (is.null(f)) return(NULL)
+    b <- coef(f)
+    tibble::tibble(threat = unname(b["effect::Threat"]), cleanup = unname(b["effect::Cleanup"]))
+  }
+
+  tr <- dplyr::bind_rows(lapply(seq_len(N_ITER), temporal_one))
+
+  tibble::tibble(Category = cname, phase = c("Threat", "Cleanup"),
+                 true_pct = 100 * (exp(c(tv["Threat"], tv["Cleanup"])) - 1),
+                 temp_p   = c(emp_p_cat(tr$threat, tv["Threat"]),
+                              emp_p_cat(tr$cleanup, tv["Cleanup"])))
+}
+
+category_placebo_results <- dplyr::bind_rows(
+  lapply(sort(unique(ED_disease$Category)), run_category_placebo))
+
+as.data.frame(category_placebo_results)
+```
+
+## Falsification test at ≥55 and ≥64 kt and for age groups
+
+The same two timing permutations, extended beyond ≥34 kt: the all-cause test at ≥55 and ≥64 kt, the cause-specific test at ≥55 and ≥64 kt, and the age-group test at all three thresholds. Age groups have only weekly baseline counts, so they use the weekly (Sunday-grid) version, as the categories do. At each threshold the storm rows, the exposed counties, and the storm-active weeks are those of that threshold, and the true estimates are refit at that threshold. The ≥34 kt results above (T8 and T9) are not changed. `run_weekly_placebo()` is `run_category_placebo()` with the storm rows, the weekly baseline, the storm-active weeks, and the threshold passed in; at ≥34 kt it reproduces T9 exactly.
+```{r}
+run_weekly_placebo <- function(sa, ns, mask_sun, th) {
+  sa <- sa |> dplyr::filter(County != 99, threshold_knots == th)
+  storm_counties <- sa |>
+    dplyr::filter(Window == "Threat_7d") |>
+    dplyr::transmute(SID, true_impact = as.Date(impact_date), ahca_code = as.integer(County)) |>
+    dplyr::distinct()
+  storms <- storm_counties |> dplyr::distinct(SID, true_impact)
+
+  storm_true <- sa |>
+    dplyr::mutate(effect = dplyr::case_when(
+      Window == "Threat_7d"                                          ~ "Threat",
+      !is.na(PostWeek) & PostWeek >= 1 & PostWeek <= n_cleanup_weeks ~ "Cleanup",
+      TRUE                                                           ~ NA_character_)) |>
+    dplyr::filter(!is.na(effect), lubridate::month(window_start) %in% 5:11) |>
+    dplyr::transmute(ahca_code = as.integer(County), Visits, window_days, effect,
+                     year_month = as.character(lubridate::floor_date(window_start, "month")))
+  none_true <- ns |>
+    dplyr::left_join(mask_sun, by = c("ahca_code", "week_sun")) |>
+    dplyr::filter(is.na(storm_active)) |>
+    dplyr::mutate(week_mon = week_sun + 1L) |>
+    dplyr::filter(lubridate::month(week_mon) %in% 5:11, week_mon <= none_end_date) |>
+    dplyr::transmute(ahca_code, Visits, window_days = 7L, effect = "None",
+                     year_month = as.character(lubridate::floor_date(week_mon, "month")))
+  panel_true <- dplyr::bind_rows(storm_true, none_true) |>
+    dplyr::mutate(effect = factor(effect, levels = c("None", "Cleanup", "Threat")),
+                  year_month = factor(year_month), county_fe = factor(ahca_code))
+
+  ft <- tryCatch(fixest::fepois(Visits ~ i(effect, ref = "None") | county_fe + year_month,
+                                offset = ~ log(window_days), data = panel_true,
+                                cluster = ~ county_fe + year_month),
+                 error = function(e) NULL)
+  if (is.null(ft)) return(NULL)
+  bt <- coef(ft)
+  tv <- c(Threat = unname(bt["effect::Threat"]), Cleanup = unname(bt["effect::Cleanup"]))
+
+  temporal_one <- function(i) {
+    rand <- storms |>
+      dplyr::rowwise() |>
+      dplyr::mutate(w0 = {
+        cand <- sundays_of_year(lubridate::year(true_impact))
+        cand <- cand[abs(as.integer(cand - true_impact)) >= 16 & cand + 7 <= none_end_date]
+        if (length(cand) == 0) as.Date(NA) else sample(cand, 1) }) |>
+      dplyr::ungroup() |>
+      dplyr::filter(!is.na(w0))
+    pseudo <- storm_counties |>
+      dplyr::inner_join(rand |> dplyr::select(SID, w0), by = "SID") |>
+      dplyr::mutate(threat_wk = w0 - 7L, cleanup_wk = w0 + 7L)
+    ps <- dplyr::bind_rows(
+      pseudo |> dplyr::transmute(ahca_code, week_sun = threat_wk,  effect = "Threat"),
+      pseudo |> dplyr::transmute(ahca_code, week_sun = cleanup_wk, effect = "Cleanup")) |>
+      dplyr::distinct(ahca_code, week_sun, effect) |>
+      dplyr::inner_join(ns, by = c("ahca_code", "week_sun")) |>
+      dplyr::mutate(week_mon = week_sun + 1L) |>
+      dplyr::filter(lubridate::month(week_mon) %in% 5:11) |>
+      dplyr::transmute(ahca_code, Visits, window_days = 7L, effect,
+                       year_month = as.character(lubridate::floor_date(week_mon, "month")))
+    pw <- dplyr::bind_rows(
+      pseudo |> dplyr::select(ahca_code, week_sun = threat_wk),
+      pseudo |> dplyr::select(ahca_code, week_sun = cleanup_wk)) |>
+      dplyr::distinct() |>
+      dplyr::mutate(is_pseudo = TRUE)
+    none_i <- ns |>
+      dplyr::left_join(mask_sun, by = c("ahca_code", "week_sun")) |>
+      dplyr::filter(is.na(storm_active)) |>
+      dplyr::left_join(pw, by = c("ahca_code", "week_sun")) |>
+      dplyr::filter(is.na(is_pseudo)) |>
+      dplyr::mutate(week_mon = week_sun + 1L) |>
+      dplyr::filter(lubridate::month(week_mon) %in% 5:11, week_mon <= none_end_date) |>
+      dplyr::transmute(ahca_code, Visits, window_days = 7L, effect = "None",
+                       year_month = as.character(lubridate::floor_date(week_mon, "month")))
+    p <- dplyr::bind_rows(ps, none_i) |>
+      dplyr::mutate(effect = factor(effect, levels = c("None", "Cleanup", "Threat")),
+                    year_month = factor(year_month), county_fe = factor(ahca_code))
+    f <- tryCatch(fixest::fepois(Visits ~ i(effect, ref = "None") | county_fe + year_month,
+                                 offset = ~ log(window_days), data = p,
+                                 cluster = ~ county_fe + year_month),
+                  error = function(e) NULL)
+    if (is.null(f)) return(NULL)
+    b <- coef(f)
+    tibble::tibble(threat = unname(b["effect::Threat"]), cleanup = unname(b["effect::Cleanup"]))
+  }
+
+  tr <- dplyr::bind_rows(lapply(seq_len(N_ITER), temporal_one))
+
+  tibble::tibble(phase = c("Threat", "Cleanup"),
+                 true_pct = 100 * (exp(c(tv["Threat"], tv["Cleanup"])) - 1),
+                 temp_p   = c(emp_p_cat(tr$threat, tv["Threat"]),
+                              emp_p_cat(tr$cleanup, tv["Cleanup"])),
+                 n_iter   = nrow(tr))
+}
+
+# Sunday-keyed storm-active weeks at each threshold
+placebo_masks <- lapply(setNames(thresholds, thresholds), function(th)
+  build_disease_mask(th, n_cleanup_weeks) |>
+    dplyr::distinct(ahca_code, week_sun) |>
+    dplyr::mutate(storm_active = TRUE))
+
+weekly_placebo_ext <- list()
+for (th in thresholds) {
+  ms <- placebo_masks[[as.character(th)]]
+  if (th != 34L) {                                   # categories at 34 kt are T9 above
+    set.seed(4242)
+    for (cn in sort(unique(ED_disease$Category))) {
+      r <- run_weekly_placebo(ED_disease |> dplyr::filter(Category == cn),
+                              combined_ns |> dplyr::filter(Category == cn) |>
+                                dplyr::mutate(week_sun = week_mon - 1L) |>
+                                dplyr::select(ahca_code, week_sun, Visits),
+                              ms, th)
+      weekly_placebo_ext[[length(weekly_placebo_ext) + 1]] <-
+        r |> dplyr::mutate(outcome = unname(cat_labels[cn]), threshold_kt = th, .before = 1)
+      invisible(gc())
+    }
+  }
+  set.seed(5151)
+  for (a in age_levels) {
+    r <- run_weekly_placebo(age_df |> dplyr::filter(SubgroupCol == a),
+                            age_ns |> dplyr::filter(SubgroupCol == a) |>
+                              dplyr::mutate(week_sun = week_mon - 1L) |>
+                              dplyr::select(ahca_code, week_sun, Visits),
+                            ms, th)
+    weekly_placebo_ext[[length(weekly_placebo_ext) + 1]] <-
+      r |> dplyr::mutate(outcome = paste("Age", a), threshold_kt = th, .before = 1)
+    invisible(gc())
+  }
+}
+weekly_placebo_ext <- dplyr::bind_rows(weekly_placebo_ext)
+
+# all-cause daily test at 55 and 64 kt: run_temporal_permutation() reads storm_county_exposure
+storm_county_exposure_34 <- storm_county_exposure
+allcause_placebo_ext <- list()
+for (th in c(55L, 64L)) {
+  storm_county_exposure <- ED_allcause |>
+    dplyr::filter(County != 99, threshold_knots == th) |>
+    dplyr::distinct(SID, County, impact_date) |>
+    dplyr::rename(ahca_code = County, true_impact = impact_date)
+  set.seed(20250528)
+  tc <- dplyr::bind_rows(lapply(seq_len(N_ITER), run_temporal_permutation))
+  tru <- fig_dat |>
+    dplyr::filter(as.integer(gsub("\\D", "", as.character(threshold))) == th) |>
+    dplyr::transmute(effect_label = as.character(effect_label),
+                     true_beta = log(1 + pct_change / 100))
+  allcause_placebo_ext[[as.character(th)]] <- tc |>
+    dplyr::left_join(tru, by = "effect_label") |>
+    dplyr::group_by(effect_label) |>
+    dplyr::summarize(threshold_kt = th,
+                     n_iter       = dplyr::n(),
+                     true_pct     = 100 * (exp(dplyr::first(true_beta)) - 1),
+                     emp_p        = compute_emp_p(estimate, dplyr::first(true_beta), dplyr::n()),
+                     placebo_mean_pct = 100 * (exp(mean(estimate)) - 1),
+                     placebo_sd   = sd(estimate),
+                     .groups = "drop")
+  invisible(gc())
+}
+allcause_placebo_ext <- dplyr::bind_rows(allcause_placebo_ext)
+storm_county_exposure <- storm_county_exposure_34
+
+as.data.frame(allcause_placebo_ext)
+as.data.frame(weekly_placebo_ext)
+```
+
+## Results tables
+
+Collect every number reported in the manuscript and write each table to `outputs/results_tables/`.
+```{r}
+tab_dir <- file.path(out_dir, "results_tables")
+dir.create(tab_dir, showWarnings = FALSE)
+
+emit <- function(df, file) {
+  readr::write_csv(df, file.path(tab_dir, file))
+  as.data.frame(df)
+}
+phase_ord <- function(x) factor(x, levels = c("Threat", "Impact", "Cleanup"))
+```
+
+Storms and counties by wind threshold (Methods)
+```{r}
+ED_allcause |>
+  dplyr::filter(County != 99, lubridate::month(window_start) %in% 5:11, !is.na(Visits)) |>
+  dplyr::group_by(threshold_kt = threshold_knots) |>
+  dplyr::summarize(n_storms     = dplyr::n_distinct(SID),
+                   first_impact = min(impact_date, na.rm = TRUE),
+                   last_impact  = max(impact_date, na.rm = TRUE),
+                   n_counties   = dplyr::n_distinct(County),
+                   .groups = "drop") |>
+  emit("T1_study_inventory.csv")
+```
+
+Analytic panel at ≥34 kt (Methods)
+```{r}
+ED_panel |>
+  dplyr::group_by(phase = as.character(effect)) |>
+  dplyr::summarize(n_obs        = dplyr::n(),
+                   total_visits = sum(Visits, na.rm = TRUE),
+                   mean_visits  = round(mean(Visits, na.rm = TRUE), 1),
+                   .groups = "drop") |>
+  emit("T2_panel_composition.csv")
+```
+
+All-cause phase effects (Results 3.1, Figure 2)
+```{r}
+fig_dat |>
+  dplyr::transmute(threshold = as.character(threshold),
+                   phase = phase_ord(as.character(effect_label)),
+                   pct_change, ci_low = pct_ci_lo, ci_high = pct_ci_hi, p_value = p.value) |>
+  dplyr::arrange(threshold, phase) |>
+  emit("T3_allcause_phase_effects.csv")
+```
+
+Attributable fraction and number (Table 1)
+```{r}
+attributable_risk |>
+  dplyr::transmute(Outcome, phase = phase_ord(effect_label), n, beta,
+                   AF_pct = AF, AF_pct_lo = AF_lo, AF_pct_hi = AF_hi,
+                   AN, AN_lo, AN_hi, p_value = p.value,
+                   impact_coverage_pct = ifelse(effect_label == "Impact", impact_coverage_pct, NA)) |>
+  emit("T4_attributable_fraction_number.csv")
+```
+
+Attributable fraction and number at ≥64 kt (Table 2)
+```{r}
+attributable_risk_64 |>
+  dplyr::transmute(Outcome, phase = phase_ord(effect_label), n, beta,
+                   AF_pct = AF, AF_pct_lo = AF_lo, AF_pct_hi = AF_hi,
+                   AN, AN_lo, AN_hi, p_value = p.value,
+                   impact_coverage_pct = ifelse(effect_label == "Impact", impact_coverage_pct, NA)) |>
+  emit("T4b_attributable_fraction_number_64kt.csv")
+```
+
+Cause-specific phase effects (Results 3.2, Figure 3)
+```{r}
+disease_results_all |>
+  dplyr::filter(!is.na(effect_label)) |>
+  dplyr::transmute(category = cat_labels[Category],
+                   threshold = paste0(">=", threshold_knots, " kt"),
+                   phase = phase_ord(effect_label),
+                   pct_change, ci_low = pct_ci_lo, ci_high = pct_ci_hi, p_value = p.value) |>
+  dplyr::arrange(threshold, phase, dplyr::desc(pct_change)) |>
+  emit("T5_cause_specific_effects.csv")
+```
+
+Age-group phase effects (Results 3.3, Figure 4)
+```{r}
+age_results_all |>
+  dplyr::filter(!is.na(effect_label)) |>
+  dplyr::transmute(age_group = factor(Subgroup, levels = age_levels),
+                   threshold = paste0(">=", threshold_knots, " kt"),
+                   phase = phase_ord(effect_label),
+                   pct_change, ci_low = pct_ci_lo, ci_high = pct_ci_hi, p_value = p.value) |>
+  dplyr::arrange(threshold, phase, age_group) |>
+  emit("T6_age_group_effects.csv")
+```
+
+Threat phase with and without the swath (Discussion)
+```{r}
+dplyr::bind_rows(
+  statewide_threat |>
+    dplyr::filter(effect_label == "Threat") |>
+    dplyr::transmute(threshold, model = "All counties (no swath)", effect_label,
+                     pct_change, ci_low = pct_ci_lo, ci_high = pct_ci_hi, p_value = p.value),
+  threat_inside_outside |>
+    dplyr::transmute(threshold, model = "Inside vs outside swath", effect_label,
+                     pct_change, ci_low = pct_ci_lo, ci_high = pct_ci_hi, p_value = p.value,
+                     n_obs, in_minus_out_pct, in_vs_out_p)) |>
+  emit("T7_threat_without_swath.csv")
+```
+
+Falsification, all-cause and cause-specific (Results 3.5)
+```{r}
+empirical_p |>
+  dplyr::left_join(placebo_summary, by = c("type", "effect_label")) |>
+  dplyr::transmute(phase = phase_ord(effect_label), true_pct, emp_p = emp_p_onesided,
+                   placebo_mean = mean_est, placebo_sd = sd_est, n_iter) |>
+  dplyr::arrange(phase) |>
+  emit("T8_falsification_allcause.csv")
+
+category_placebo_results |>
+  dplyr::transmute(category = cat_labels[Category],
+                   phase = factor(phase, levels = c("Threat", "Cleanup")),
+                   true_pct, emp_p = temp_p) |>
+  dplyr::arrange(phase, dplyr::desc(true_pct)) |>
+  emit("T9_falsification_categories.csv")
+```
+
+Falsification at ≥55 and ≥64 kt and for age groups (Results 3.5)
+```{r}
+dplyr::bind_rows(
+  allcause_placebo_ext |>
+    dplyr::transmute(outcome = "All-cause", threshold_kt, phase = as.character(effect_label),
+                     true_pct, emp_p, n_iter),
+  weekly_placebo_ext |>
+    dplyr::transmute(outcome, threshold_kt, phase, true_pct, emp_p = temp_p, n_iter)) |>
+  dplyr::mutate(phase = phase_ord(phase)) |>
+  dplyr::arrange(threshold_kt, phase, outcome) |>
+  emit("T10_falsification_extended.csv")
+```
